@@ -6,6 +6,8 @@
  * through a callback interface. No cursor-up, no re-rendering,
  * no batch processing.
  *
+ * Inspired by md4c (https://github.com/mity/md4c) by Martin Mitáš.
+ *
  * Usage:
  *   struct md4s_parser *p = md4s_create(my_callback, my_data);
  *   md4s_feed(p, chunk1, len1);

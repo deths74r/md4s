@@ -6,6 +6,8 @@
  * classified, parsed for inline spans, and emitted as semantic events.
  * Completed lines are never revisited.
  *
+ * Inspired by md4c (https://github.com/mity/md4c) by Martin Mitáš.
+ *
  * Two states: NORMAL and FENCED_CODE. Everything else is inter-line
  * flags (list depth, blockquote depth, previous line type).
  */

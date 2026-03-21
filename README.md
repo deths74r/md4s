@@ -164,6 +164,10 @@ Events come in pairs (`_ENTER` / `_LEAVE`) for styled regions. Content arrives v
 make test
 ```
 
+## Acknowledgments
+
+md4s was inspired by [md4c](https://github.com/mity/md4c) by Martin Mitáš — an excellent CommonMark parser for C. md4c served as the reference implementation we studied while designing md4s's streaming architecture. The name "md4s" (Markdown for Streaming) is a deliberate nod to md4c (Markdown for C). No code was derived from md4c; md4s is an independent implementation built around a fundamentally different design (line-based streaming vs. batch parsing), but md4c's thorough handling of CommonMark edge cases informed many of our decisions. Thank you, Martin.
+
 ## License
 
 MIT
