@@ -3246,6 +3246,86 @@ TEST(md4s_table_pipe_in_paragraph)
 }
 
 /* ================================================================== */
+/* Group 45: Unicode-aware word boundary tests                        */
+/* ================================================================== */
+
+/* Em dash (U+2014, Pd) before underscore → word boundary → italic */
+TEST(md4s_unicode_emdash_boundary)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p =
+		feed_and_finalize(&ctx, "\xe2\x80\x94_italic_\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_ITALIC_ENTER));
+	md4s_destroy(p);
+}
+
+/* CJK ideograph before underscore → NOT boundary → no italic */
+TEST(md4s_unicode_cjk_no_boundary)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p =
+		feed_and_finalize(&ctx,
+			"\xe4\xb8\xad_word_\xe6\x96\x87\n");
+	/* U+4E2D (中) is Lo, not punct/ws → not a boundary */
+	ASSERT_FALSE(has_event(&ctx, MD4S_ITALIC_ENTER));
+	md4s_destroy(p);
+}
+
+/* Left double quote (U+201C, Pi) → word boundary → italic */
+TEST(md4s_unicode_smart_quote_boundary)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p =
+		feed_and_finalize(&ctx,
+			"\xe2\x80\x9c_italic_\xe2\x80\x9d\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_ITALIC_ENTER));
+	md4s_destroy(p);
+}
+
+/* Non-breaking space (U+00A0) → whitespace → word boundary */
+TEST(md4s_unicode_nbsp_boundary)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p =
+		feed_and_finalize(&ctx, "\xc2\xa0_italic_\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_ITALIC_ENTER));
+	md4s_destroy(p);
+}
+
+/* Euro sign (U+20AC, Sc) → punctuation → word boundary */
+TEST(md4s_unicode_euro_boundary)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p =
+		feed_and_finalize(&ctx, "\xe2\x82\xac_italic_\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_ITALIC_ENTER));
+	md4s_destroy(p);
+}
+
+/* Cyrillic letter before underscore → NOT boundary → no italic */
+TEST(md4s_unicode_cyrillic_no_boundary)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p =
+		feed_and_finalize(&ctx,
+			"\xd0\x90_word_\xd0\x91\n");
+	/* U+0410 (А) is Lu → not punct/ws → not boundary */
+	ASSERT_FALSE(has_event(&ctx, MD4S_ITALIC_ENTER));
+	md4s_destroy(p);
+}
+
+/* Asterisk emphasis is NOT affected by word boundary (only underscore is) */
+TEST(md4s_unicode_star_ignores_boundary)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p =
+		feed_and_finalize(&ctx,
+			"\xe4\xb8\xad*italic*\xe6\x96\x87\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_ITALIC_ENTER));
+	md4s_destroy(p);
+}
+
+/* ================================================================== */
 /* Group 44: Security hardening tests                                 */
 /* ================================================================== */
 

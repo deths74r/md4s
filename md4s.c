@@ -13,6 +13,7 @@
  */
 #define _GNU_SOURCE
 #include "md4s.h"
+#include "gstr.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -244,10 +245,40 @@ static bool is_thematic_break(const char *s, size_t len)
 	return count >= 3;
 }
 
-static bool is_word_boundary(char c)
+/*
+ * Unicode-aware word boundary check for emphasis flanking.
+ * Classifies the codepoint at the given position.
+ * Returns true if the position is at a boundary (start/end of text,
+ * whitespace, or punctuation/symbol).
+ *
+ * When look_before is true, examines the codepoint ending at pos.
+ * When false, examines the codepoint starting at pos.
+ */
+static bool is_word_boundary(const char *text, size_t len, size_t pos,
+			     bool look_before)
 {
-	return c == '\0' || isspace((unsigned char)c) ||
-	       ispunct((unsigned char)c);
+	if (look_before && pos == 0)
+		return true;
+	if (!look_before && pos >= len)
+		return true;
+
+	uint32_t cp;
+	if (look_before) {
+		size_t prev = utf8_prev(text, len, pos);
+		utf8_decode(text + prev, pos - prev, &cp);
+	} else {
+		utf8_decode(text + pos, len - pos, &cp);
+	}
+
+	if (cp == 0)
+		return true;
+	/* Note: ZWSP (U+200B) is intentionally "other", not whitespace.
+	 * See CommonMark spec and gstr spec 11 Change 10. */
+	if (gstr_is_whitespace_cp(cp))
+		return true;
+	if (gstr_is_unicode_punctuation(cp))
+		return true;
+	return false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1029,10 +1060,8 @@ static size_t find_single_close(const char *text, size_t len,
 			}
 			/* Underscore: require word boundary after. */
 			if (ch == '_') {
-				char after = (pos + 1 < len)
-						     ? text[pos + 1]
-						     : '\0';
-				if (!is_word_boundary(after)) {
+				if (!is_word_boundary(text, len,
+						     pos + 1, false)) {
 					pos++;
 					continue;
 				}
@@ -1070,7 +1099,11 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 		/* Escaped character. */
 		if (text[pos] == '\\' && pos + 1 < length) {
 			char next = text[pos + 1];
-			if (ispunct((unsigned char)next)) {
+			/* CommonMark 2.4: only ASCII punctuation can be escaped. */
+			if ((next >= 0x21 && next <= 0x2F) ||
+			    (next >= 0x3A && next <= 0x40) ||
+			    (next >= 0x5B && next <= 0x60) ||
+			    (next >= 0x7B && next <= 0x7E)) {
 				if (pos > plain_start)
 					emit_text(p, MD4S_TEXT,
 						  text + plain_start,
@@ -1159,12 +1192,10 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 		     (text[pos] == '_' && text[pos + 1] == '_' &&
 		      text[pos + 2] == '_'))) {
 			char ch = text[pos];
-			/* Underscore: check word boundary. */
+			/* Underscore: check word boundary before opener. */
 			if (ch == '_') {
-				char before = (pos > 0)
-						      ? text[pos - 1]
-						      : '\0';
-				if (!is_word_boundary(before)) {
+				if (!is_word_boundary(text, length,
+						     pos, true)) {
 					pos++;
 					continue;
 				}
@@ -1210,10 +1241,8 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 		     (text[pos] == '_' && text[pos + 1] == '_'))) {
 			char ch = text[pos];
 			if (ch == '_') {
-				char before = (pos > 0)
-						      ? text[pos - 1]
-						      : '\0';
-				if (!is_word_boundary(before)) {
+				if (!is_word_boundary(text, length,
+						     pos, true)) {
 					pos++;
 					continue;
 				}
@@ -1266,10 +1295,8 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 				continue;
 			}
 			if (ch == '_') {
-				char before = (pos > 0)
-						      ? text[pos - 1]
-						      : '\0';
-				if (!is_word_boundary(before)) {
+				if (!is_word_boundary(text, length,
+						     pos, true)) {
 					pos++;
 					continue;
 				}
