@@ -3245,6 +3245,123 @@ TEST(md4s_table_pipe_in_paragraph)
 	md4s_destroy(p);
 }
 
+/* ================================================================== */
+/* Group 44: Security hardening tests                                 */
+/* ================================================================== */
+
+/* Deep inline nesting → capped at MAX_INLINE_DEPTH, no crash */
+TEST(md4s_security_deep_nesting)
+{
+	struct recorder_ctx ctx = {0};
+	/* Build deeply nested bold: **a**a**a**... */
+	char deep[2048];
+	int pos = 0;
+	for (int i = 0; i < 100 && pos < 2000; i++) {
+		deep[pos++] = '*';
+		deep[pos++] = 'a';
+		deep[pos++] = '*';
+	}
+	deep[pos++] = '\n';
+	deep[pos] = '\0';
+	struct md4s_parser *p = feed_and_finalize(&ctx, deep);
+	/* Must not crash — that's the test */
+	ASSERT_TRUE(ctx.count > 0);
+	md4s_destroy(p);
+}
+
+/* Recursive link nesting → depth limited */
+TEST(md4s_security_recursive_links)
+{
+	struct recorder_ctx ctx = {0};
+	/* Nested links: [a[b[c[d](u)](u)](u)](u) */
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"[a[b[c[d[e[f[g[h[i[j[k[l[m[n[o[p"
+		"](u)](u)](u)](u)](u)](u)](u)](u)](u)"
+		"](u)](u)](u)](u)](u)](u)](u)\n");
+	/* Must not crash */
+	ASSERT_TRUE(ctx.count > 0);
+	md4s_destroy(p);
+}
+
+/* Ordered list with huge number → capped at 9 digits */
+TEST(md4s_security_olist_overflow)
+{
+	struct recorder_ctx ctx = {0};
+	/* 20 digits would overflow int. Should be capped to 9. */
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"99999999999999999999. item\n");
+	/* Should NOT be a list (>9 digits fails the digit cap) */
+	ASSERT_FALSE(has_event(&ctx, MD4S_LIST_ENTER));
+	md4s_destroy(p);
+}
+
+/* Valid 9-digit ordered list */
+TEST(md4s_security_olist_max_valid)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"999999999. item\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_LIST_ENTER));
+	md4s_destroy(p);
+}
+
+/* NULL byte replacement → U+FFFD */
+TEST(md4s_security_null_byte)
+{
+	struct recorder_ctx ctx = {0};
+	/* Feed bytes with embedded NUL: "a\0b\n" */
+	struct md4s_parser *p = md4s_create(recorder_callback, &ctx);
+	char data[] = {'a', '\0', 'b', '\n'};
+	md4s_feed(p, data, 4);
+	char *raw = md4s_finalize(p);
+	/* The NUL should be replaced with U+FFFD (EF BF BD) */
+	/* So the text event should contain "a\xEF\xBF\xBDb" */
+	bool found_replacement = false;
+	for (int i = 0; i < ctx.count; i++) {
+		if (ctx.events[i].event == MD4S_TEXT &&
+		    strstr(ctx.events[i].text, "\xEF\xBF\xBD") != NULL)
+			found_replacement = true;
+	}
+	ASSERT_TRUE(found_replacement);
+	free(raw);
+	md4s_destroy(p);
+}
+
+/* NULL byte doesn't truncate output */
+TEST(md4s_security_null_preserves_content)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = md4s_create(recorder_callback, &ctx);
+	char data[] = {'h', 'e', '\0', 'l', 'o', '\n'};
+	md4s_feed(p, data, 6);
+	char *raw = md4s_finalize(p);
+	/* Content after NUL should still be present */
+	bool found_lo = false;
+	for (int i = 0; i < ctx.count; i++) {
+		if (ctx.events[i].event == MD4S_TEXT &&
+		    strstr(ctx.events[i].text, "lo") != NULL)
+			found_lo = true;
+	}
+	ASSERT_TRUE(found_lo);
+	free(raw);
+	md4s_destroy(p);
+}
+
+/* Many unclosed emphasis delimiters → no quadratic crash */
+TEST(md4s_security_many_unclosed)
+{
+	struct recorder_ctx ctx = {0};
+	char line[5002];
+	for (int i = 0; i < 5000; i++)
+		line[i] = '*';
+	line[5000] = '\n';
+	line[5001] = '\0';
+	struct md4s_parser *p = feed_and_finalize(&ctx, line);
+	/* Must not crash or hang */
+	ASSERT_TRUE(ctx.count > 0);
+	md4s_destroy(p);
+}
+
 /* Integration tests (continued)                                      */
 /* ================================================================== */
 

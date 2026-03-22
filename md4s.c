@@ -43,6 +43,9 @@ static char *md4s_strndup_(const char *s, size_t n)
 #define RAW_BUFFER_INITIAL    4096
 #define GROWTH_FACTOR         2
 #define MAX_LINK_DEFS         256
+#define MAX_INLINE_DEPTH      32
+#define MAX_OLIST_DIGITS      9
+#define MAX_BUFFER_SIZE       (256 * 1024 * 1024)  /* 256 MB */
 
 /* ------------------------------------------------------------------ */
 /* Internal types                                                     */
@@ -154,24 +157,41 @@ static void emit_text(struct md4s_parser *p, enum md4s_event event,
 	emit(p, event, &d);
 }
 
-static void buf_ensure(char **buf, size_t *cap, size_t needed)
+static bool buf_ensure(char **buf, size_t *cap, size_t needed)
 {
 	if (needed <= *cap)
-		return;
+		return true;
+	if (needed > MAX_BUFFER_SIZE)
+		return false;
 	size_t new_cap = *cap;
-	while (new_cap < needed)
-		new_cap *= GROWTH_FACTOR;
-	*buf = realloc(*buf, new_cap);
+	while (new_cap < needed) {
+		size_t next = new_cap * GROWTH_FACTOR;
+		if (next <= new_cap || next > MAX_BUFFER_SIZE) {
+			new_cap = needed; /* clamp to exact size */
+			break;
+		}
+		new_cap = next;
+	}
+	char *new_buf = realloc(*buf, new_cap);
+	if (new_buf == NULL)
+		return false;
+	*buf = new_buf;
 	*cap = new_cap;
+	return true;
 }
 
-static void buf_append(char **buf, size_t *len, size_t *cap,
+static bool buf_append(char **buf, size_t *len, size_t *cap,
 		       const char *data, size_t data_len)
 {
-	buf_ensure(buf, cap, *len + data_len + 1);
+	size_t needed = *len + data_len + 1;
+	if (needed < *len) /* overflow check */
+		return false;
+	if (!buf_ensure(buf, cap, needed))
+		return false;
 	memcpy(*buf + *len, data, data_len);
 	*len += data_len;
 	(*buf)[*len] = '\0';
+	return true;
 }
 
 static int count_leading(const char *s, size_t len, char ch)
@@ -458,6 +478,8 @@ static bool is_html_block_end(const char *line, size_t len)
 }
 
 /* Forward declaration: parse_inline is used by emit_table_row. */
+static void parse_inline_depth(struct md4s_parser *p, const char *text,
+			       size_t length, int depth);
 static void parse_inline(struct md4s_parser *p, const char *text,
 			 size_t length);
 
@@ -868,11 +890,12 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 		}
 	}
 
-	/* Ordered list: optional indent, digits, [.)] space. */
+	/* Ordered list: optional indent, 1-9 digits, [.)] space. */
 	{
 		size_t indent = count_leading_spaces(line, len);
 		size_t i = indent;
-		while (i < len && line[i] >= '0' && line[i] <= '9')
+		while (i < len && i < indent + MAX_OLIST_DIGITS &&
+		       line[i] >= '0' && line[i] <= '9')
 			i++;
 		if (i > indent && i < len &&
 		    (line[i] == '.' || line[i] == ')') &&
@@ -1027,6 +1050,19 @@ static size_t find_single_close(const char *text, size_t len,
 static void parse_inline(struct md4s_parser *p, const char *text,
 			 size_t length)
 {
+	parse_inline_depth(p, text, length, 0);
+}
+
+static void parse_inline_depth(struct md4s_parser *p, const char *text,
+			       size_t length, int depth)
+{
+	if (depth >= MAX_INLINE_DEPTH) {
+		/* Too deep — emit remaining text as literal. */
+		if (length > 0)
+			emit_text(p, MD4S_TEXT, text, length);
+		return;
+	}
+
 	size_t pos = 0;
 	size_t plain_start = 0;
 
@@ -1157,8 +1193,9 @@ static void parse_inline(struct md4s_parser *p, const char *text,
 						  pos - plain_start);
 				emit_simple(p, MD4S_BOLD_ENTER);
 				emit_simple(p, MD4S_ITALIC_ENTER);
-				parse_inline(p, text + inner_start,
-					     close - inner_start);
+				parse_inline_depth(p, text + inner_start,
+					     close - inner_start,
+					     depth + 1);
 				emit_simple(p, MD4S_ITALIC_LEAVE);
 				emit_simple(p, MD4S_BOLD_LEAVE);
 				pos = close + 3;
@@ -1189,8 +1226,9 @@ static void parse_inline(struct md4s_parser *p, const char *text,
 						  text + plain_start,
 						  pos - plain_start);
 				emit_simple(p, MD4S_BOLD_ENTER);
-				parse_inline(p, text + pos + 2,
-					     close - pos - 2);
+				parse_inline_depth(p, text + pos + 2,
+					     close - pos - 2,
+					     depth + 1);
 				emit_simple(p, MD4S_BOLD_LEAVE);
 				pos = close + 2;
 				plain_start = pos;
@@ -1209,8 +1247,9 @@ static void parse_inline(struct md4s_parser *p, const char *text,
 						  text + plain_start,
 						  pos - plain_start);
 				emit_simple(p, MD4S_STRIKETHROUGH_ENTER);
-				parse_inline(p, text + pos + 2,
-					     close - pos - 2);
+				parse_inline_depth(p, text + pos + 2,
+					     close - pos - 2,
+					     depth + 1);
 				emit_simple(p, MD4S_STRIKETHROUGH_LEAVE);
 				pos = close + 2;
 				plain_start = pos;
@@ -1243,8 +1282,9 @@ static void parse_inline(struct md4s_parser *p, const char *text,
 						  text + plain_start,
 						  pos - plain_start);
 				emit_simple(p, MD4S_ITALIC_ENTER);
-				parse_inline(p, text + pos + 1,
-					     close - pos - 1);
+				parse_inline_depth(p, text + pos + 1,
+					     close - pos - 1,
+					     depth + 1);
 				emit_simple(p, MD4S_ITALIC_LEAVE);
 				pos = close + 1;
 				plain_start = pos;
@@ -1394,9 +1434,10 @@ static void parse_inline(struct md4s_parser *p, const char *text,
 						? MD4S_IMAGE_LEAVE
 						: MD4S_LINK_LEAVE;
 					emit(p, enter, &d);
-					parse_inline(p,
+					parse_inline_depth(p,
 						text + bracket_start + 1,
-						bracket - bracket_start - 1);
+						bracket - bracket_start - 1,
+						depth + 1);
 					emit_simple(p, leave);
 					pos = paren + 1;
 					plain_start = pos;
@@ -1437,9 +1478,10 @@ static void parse_inline(struct md4s_parser *p, const char *text,
 						emit(p, is_image
 							? MD4S_IMAGE_ENTER
 							: MD4S_LINK_ENTER, &d);
-						parse_inline(p,
+						parse_inline_depth(p,
 							text + bracket_start + 1,
-							bracket - bracket_start - 1);
+							bracket - bracket_start - 1,
+							depth + 1);
 						emit_simple(p, is_image
 							? MD4S_IMAGE_LEAVE
 							: MD4S_LINK_LEAVE);
@@ -1901,9 +1943,22 @@ void md4s_feed(struct md4s_parser *parser, const char *data, size_t length)
 
 	/* Process byte by byte looking for newlines. */
 	for (size_t i = 0; i < length; i++) {
-		/* Append to line buffer. */
-		buf_ensure(&parser->line_buf, &parser->line_cap,
-			   parser->line_len + 2);
+		/* Append to line buffer, replacing NUL with U+FFFD. */
+		if (data[i] == '\0') {
+			/* U+FFFD REPLACEMENT CHARACTER = EF BF BD */
+			if (!buf_ensure(&parser->line_buf,
+					&parser->line_cap,
+					parser->line_len + 5))
+				return;
+			parser->line_buf[parser->line_len++] = (char)0xEF;
+			parser->line_buf[parser->line_len++] = (char)0xBF;
+			parser->line_buf[parser->line_len++] = (char)0xBD;
+			parser->line_buf[parser->line_len] = '\0';
+			continue;
+		}
+		if (!buf_ensure(&parser->line_buf, &parser->line_cap,
+				parser->line_len + 2))
+			return;
 		parser->line_buf[parser->line_len++] = data[i];
 		parser->line_buf[parser->line_len] = '\0';
 
