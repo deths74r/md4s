@@ -1950,14 +1950,17 @@ TEST(md4s_feed_valid)
 /* Group 27: md4s_feed newline processing (L1022-1040)                */
 /* ================================================================== */
 
-/* Newline triggers line processing */
+/* Newline triggers line processing. First paragraph lines are
+ * deferred for setext/table lookahead, so the paragraph is
+ * emitted at finalize or when the next line confirms. */
 TEST(md4s_feed_newline_triggers)
 {
 	struct recorder_ctx ctx = {0};
 	struct md4s_parser *p = md4s_create(recorder_callback, &ctx);
 	md4s_feed(p, "hello\n", 6);
-	ASSERT_TRUE(has_event(&ctx, MD4S_PARAGRAPH_ENTER));
+	/* Deferred — paragraph emitted at finalize. */
 	char *raw = md4s_finalize(p);
+	ASSERT_TRUE(has_event(&ctx, MD4S_PARAGRAPH_ENTER));
 	free(raw);
 	md4s_destroy(p);
 }
@@ -1972,7 +1975,9 @@ TEST(md4s_feed_no_newline_partial)
 	md4s_destroy(p);
 }
 
-/* Partial then newline → PARTIAL_CLEAR before processing */
+/* Partial then newline → PARTIAL_CLEAR before processing.
+ * First paragraph line is deferred, so paragraph appears
+ * at finalize or next line. */
 TEST(md4s_feed_partial_then_newline)
 {
 	struct recorder_ctx ctx = {0};
@@ -1981,24 +1986,23 @@ TEST(md4s_feed_partial_then_newline)
 	ASSERT_TRUE(has_event(&ctx, MD4S_PARTIAL_LINE));
 	md4s_feed(p, "\n", 1);
 	ASSERT_TRUE(has_event(&ctx, MD4S_PARTIAL_CLEAR));
-	ASSERT_TRUE(has_event(&ctx, MD4S_PARAGRAPH_ENTER));
+	/* Deferred — paragraph emitted at finalize. */
 	char *raw = md4s_finalize(p);
+	ASSERT_TRUE(has_event(&ctx, MD4S_PARAGRAPH_ENTER));
 	free(raw);
 	md4s_destroy(p);
 }
 
-/* Whole line at once → no PARTIAL_CLEAR at newline
- * (internal partial may be emitted per-byte but cleared during same feed) */
+/* Whole line at once — first paragraph line is deferred for
+ * setext lookahead, confirmed at finalize. */
 TEST(md4s_feed_whole_line)
 {
 	struct recorder_ctx ctx = {0};
 	struct md4s_parser *p = md4s_create(recorder_callback, &ctx);
 	md4s_feed(p, "hello\n", 6);
-	/* After newline, line_len resets to 0, so no partial is emitted
-	 * at the end of this feed call. But partial may have been emitted
-	 * and cleared mid-feed. The important thing is we processed. */
-	ASSERT_TRUE(has_event(&ctx, MD4S_PARAGRAPH_ENTER));
+	/* Deferred — paragraph emitted at finalize. */
 	char *raw = md4s_finalize(p);
+	ASSERT_TRUE(has_event(&ctx, MD4S_PARAGRAPH_ENTER));
 	free(raw);
 	md4s_destroy(p);
 }
@@ -2861,13 +2865,14 @@ TEST(md4s_reflink_image)
 /* Group 42: Lazy blockquote continuation (new feature)               */
 /* ================================================================== */
 
-/* Lazy continuation: paragraph after > continues blockquote */
+/* Lazy continuation: paragraph after > continues blockquote.
+ * With recursive blockquote parsing, all content is in one blockquote. */
 TEST(md4s_lazy_blockquote_basic)
 {
 	struct recorder_ctx ctx = {0};
 	struct md4s_parser *p = feed_and_finalize(&ctx,
 		"> first\nsecond\n");
-	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_BLOCKQUOTE_ENTER));
+	ASSERT_EQUAL_INT(1, count_events(&ctx, MD4S_BLOCKQUOTE_ENTER));
 	md4s_destroy(p);
 }
 
@@ -2882,13 +2887,13 @@ TEST(md4s_lazy_blockquote_blank_stops)
 	md4s_destroy(p);
 }
 
-/* Multiple lazy continuation lines */
+/* Multiple lazy continuation lines — single blockquote */
 TEST(md4s_lazy_blockquote_multi)
 {
 	struct recorder_ctx ctx = {0};
 	struct md4s_parser *p = feed_and_finalize(&ctx,
 		"> first\nsecond\nthird\n");
-	ASSERT_EQUAL_INT(3, count_events(&ctx, MD4S_BLOCKQUOTE_ENTER));
+	ASSERT_EQUAL_INT(1, count_events(&ctx, MD4S_BLOCKQUOTE_ENTER));
 	md4s_destroy(p);
 }
 
@@ -4034,13 +4039,17 @@ TEST(md4s_interrupt_olist_nonone_no_para)
 	md4s_destroy(p);
 }
 
-/* Empty unordered list item cannot interrupt paragraph */
+/* Empty unordered list item `- ` is also a valid setext underline.
+ * Per CommonMark, setext heading takes priority, so `para\n- \n`
+ * becomes `<h2>para</h2>`. Test with `*` marker instead. */
 TEST(md4s_interrupt_empty_ulist)
 {
 	struct recorder_ctx ctx = {0};
 	struct md4s_parser *p = feed_and_finalize(&ctx,
-		"para\n- \n");
-	/* The "- " has empty content, should not interrupt. */
+		"para\n* \n");
+	/* The "* " has empty content, cannot interrupt paragraph.
+	 * But "* " is also a thematic break candidate (need 3+).
+	 * Single "* " is just a list marker with empty content. */
 	ASSERT_EQUAL_INT(1, count_events(&ctx, MD4S_PARAGRAPH_ENTER));
 	ASSERT_TRUE(!has_event(&ctx, MD4S_LIST_ENTER));
 	md4s_destroy(p);

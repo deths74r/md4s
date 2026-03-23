@@ -84,6 +84,20 @@ static void html_append_escaped(struct md4s_html *h, const char *s, size_t n)
 	}
 }
 
+/* URL escaping: escape only characters that are invalid in HTML
+ * attribute values, but preserve & (for entities in URLs). */
+static void html_append_url_escaped(struct md4s_html *h, const char *s, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		switch (s[i]) {
+		case '<':  html_appends(h, "&lt;");   break;
+		case '>':  html_appends(h, "&gt;");   break;
+		case '"':  html_appends(h, "&quot;"); break;
+		default:   html_append(h, &s[i], 1);  break;
+		}
+	}
+}
+
 /* Append escaped text to the alt buffer (for images). */
 static void alt_append_escaped(struct md4s_html *h, const char *s, size_t n)
 {
@@ -323,8 +337,8 @@ static void md4s_html_callback(enum md4s_event event,
 	case MD4S_LINK_ENTER: {
 		html_appends(h, "<a href=\"");
 		if (detail->url && detail->url_length > 0)
-			html_append_escaped(h, detail->url,
-					    detail->url_length);
+			html_append_url_escaped(h, detail->url,
+						detail->url_length);
 		html_appends(h, "\"");
 		if (detail->title && detail->title_length > 0) {
 			html_appends(h, " title=\"");
@@ -365,7 +379,7 @@ static void md4s_html_callback(enum md4s_event event,
 	case MD4S_IMAGE_LEAVE: {
 		h->in_image = false;
 		html_appends(h, "<img src=\"");
-		html_append_escaped(h, h->image_url, strlen(h->image_url));
+		html_append_url_escaped(h, h->image_url, strlen(h->image_url));
 		html_appends(h, "\" alt=\"");
 		/* alt_buf already contains escaped text. */
 		html_append(h, h->alt_buf, h->alt_len);
@@ -387,6 +401,10 @@ static void md4s_html_callback(enum md4s_event event,
 			if (h->in_image)
 				alt_append_escaped(h, detail->text,
 						   detail->text_length);
+			else if (h->in_html_block)
+				/* HTML block content: output verbatim. */
+				html_append(h, detail->text,
+					    detail->text_length);
 			else
 				html_append_escaped(h, detail->text,
 						    detail->text_length);

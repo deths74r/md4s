@@ -78,6 +78,7 @@ enum line_type {
 /* Per-level list tracking for the list stack. */
 struct list_level {
 	bool ordered;
+	char marker_char;      /* Unordered: '-', '*', '+'. Ordered: '.' or ')' */
 	int marker_indent;     /* Leading spaces before marker */
 	int content_indent;    /* Column where content starts */
 	int item_count;        /* Items emitted at this level */
@@ -134,6 +135,13 @@ struct md4s_parser {
 	/* Hard break: pending from previous paragraph line. */
 	bool hard_break_pending;
 
+	/* Paragraph close guard — prevents double PARAGRAPH_LEAVE. */
+	bool paragraph_closed;
+
+	/* True when close_paragraph was called for the just-preceding
+	 * paragraph. Used by interruption rules in process_line. */
+	bool was_paragraph;
+
 	/* Table tracking. */
 	bool in_table;
 	int table_columns;
@@ -143,8 +151,19 @@ struct md4s_parser {
 	/* HTML block type tracking (1-7). */
 	int html_block_type;
 
+	/* Indented code: deferred blank lines (trailing blanks
+	 * are not included in the code block per CommonMark). */
+	int icode_pending_blanks;
+	char *icode_pending_content[16]; /* Content of deferred blank lines */
+
 	/* Configuration flags. */
 	unsigned int flags;
+
+	/* Blockquote content accumulator. */
+	char *bq_buf;
+	size_t bq_len;
+	size_t bq_cap;
+	bool in_blockquote;
 
 	/* Deferred line for table lookahead. */
 	char *deferred_line;
@@ -975,6 +994,7 @@ struct classified_line {
 	int heading_level;      /* 1-6 for headings. */
 	int ordered_number;     /* For ordered lists. */
 	int indent;             /* Leading spaces before marker. */
+	char list_marker;       /* '-', '*', '+', '.', ')' for list items. */
 	char fence_char;        /* For fence open. */
 	int fence_length;       /* For fence open. */
 	const char *info_string; /* For fence open (language). */
@@ -1094,7 +1114,8 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 				cl.type = LINE_FENCE_OPEN;
 				cl.fence_char = ch;
 				cl.fence_length = n;
-				/* Extract info string (trim whitespace). */
+				/* Extract info string: first word only
+				 * (CommonMark spec 4.5). */
 				const char *info = lp + n;
 				size_t info_len = llen - (size_t)n;
 				while (info_len > 0 && info[0] == ' ') {
@@ -1104,6 +1125,13 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 				while (info_len > 0 &&
 				       info[info_len - 1] == ' ')
 					info_len--;
+				/* Truncate at first space (first word). */
+				for (size_t fi = 0; fi < info_len; fi++) {
+					if (info[fi] == ' ') {
+						info_len = fi;
+						break;
+					}
+				}
 				cl.info_string = info;
 				cl.info_length = info_len;
 				return cl;
@@ -1120,17 +1148,85 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 			cl.heading_level = level;
 			cl.content = lp + level;
 			cl.content_length = llen - (size_t)level;
+			/* Skip leading space after hashes. */
 			if (cl.content_length > 0 && cl.content[0] == ' ') {
 				cl.content++;
 				cl.content_length--;
 			}
-			/* Strip trailing '#' and spaces. */
-			while (cl.content_length > 0 &&
-			       cl.content[cl.content_length - 1] == '#')
-				cl.content_length--;
+			/* CommonMark closing sequence stripping:
+			 * 1. Strip trailing spaces
+			 * 2. If trailing '#' preceded by space (or
+			 *    content is all '#'), strip them
+			 * 3. Check for escaped '#' (\#)
+			 * 4. Strip trailing spaces again
+			 * 5. Strip leading spaces from content */
+			/* Step 1: strip trailing spaces. */
 			while (cl.content_length > 0 &&
 			       cl.content[cl.content_length - 1] == ' ')
 				cl.content_length--;
+			/* Step 2: check for closing '#' sequence. */
+			if (cl.content_length > 0 &&
+			    cl.content[cl.content_length - 1] == '#') {
+				/* Find where trailing '#' run starts. */
+				size_t hend = cl.content_length;
+				while (hend > 0 &&
+				       cl.content[hend - 1] == '#')
+					hend--;
+				/* Check for escaped hash: \# at end
+				 * means the '#' is literal. */
+				if (hend > 0 &&
+				    cl.content[hend - 1] == '\\') {
+					/* Escaped — don't strip. */
+				} else if (hend == 0 ||
+					   cl.content[hend - 1] == ' ') {
+					/* Valid closing sequence:
+					 * preceded by space or
+					 * content is all '#'. */
+					cl.content_length = hend;
+					/* Strip trailing spaces after
+					 * removing hashes. */
+					while (cl.content_length > 0 &&
+					       cl.content[
+						cl.content_length - 1]
+					       == ' ')
+						cl.content_length--;
+				}
+				/* else: '#' not preceded by space
+				 * (e.g., "foo#"), keep it. */
+			}
+			/* Step 5: strip leading spaces. */
+			while (cl.content_length > 0 &&
+			       cl.content[0] == ' ') {
+				cl.content++;
+				cl.content_length--;
+			}
+			return cl;
+		}
+	}
+
+	/* Indented code block: 4+ effective indent (tabs expand).
+	 * Not inside list. Disabled by NOINDENTEDCODE flag.
+	 * Must be checked BEFORE thematic break because 4-space-indented
+	 * `***` is indented code, not a thematic break (example 48). */
+	if (p->list_depth == 0 && !(p->flags & MD4S_FLAG_NOINDENTEDCODE) &&
+	    !in_open_paragraph(p)) {
+		size_t ws_bytes = 0;
+		int eff_indent = count_indent(line, len, &ws_bytes);
+		if (eff_indent >= 4 && ws_bytes > 0) {
+			cl.type = LINE_INDENTED_CODE;
+			/* Strip exactly 4 columns of indent. For simple
+			 * spaces, skip 4 bytes. For tabs, skip the bytes
+			 * consumed by count_indent but content starts at
+			 * the point where 4 columns are consumed. */
+			if (line[0] == '\t') {
+				/* A leading tab provides 4 columns. */
+				cl.content = line + 1;
+				cl.content_length = len - 1;
+			} else {
+				/* Leading spaces: skip 4 bytes. */
+				cl.content = line + 4;
+				cl.content_length = len - 4;
+			}
 			return cl;
 		}
 	}
@@ -1151,30 +1247,6 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 			cl.content_length--;
 		}
 		return cl;
-	}
-
-	/* Indented code block: 4+ effective indent (tabs expand).
-	 * Not inside list. Disabled by NOINDENTEDCODE flag. */
-	if (p->list_depth == 0 && !(p->flags & MD4S_FLAG_NOINDENTEDCODE)) {
-		size_t ws_bytes = 0;
-		int eff_indent = count_indent(line, len, &ws_bytes);
-		if (eff_indent >= 4 && ws_bytes > 0) {
-			cl.type = LINE_INDENTED_CODE;
-			/* Strip exactly 4 columns of indent. For simple
-			 * spaces, skip 4 bytes. For tabs, skip the bytes
-			 * consumed by count_indent but content starts at
-			 * the point where 4 columns are consumed. */
-			if (line[0] == '\t') {
-				/* A leading tab provides 4 columns. */
-				cl.content = line + 1;
-				cl.content_length = len - 1;
-			} else {
-				/* Leading spaces: skip 4 bytes. */
-				cl.content = line + 4;
-				cl.content_length = len - 4;
-			}
-			return cl;
-		}
 	}
 
 	/* HTML block: detect type. Disabled by NOHTMLBLOCKS flag. */
@@ -1203,6 +1275,7 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 				if (marker != '-' || !is_thematic_break(line, len)) {
 					cl.type = LINE_UNORDERED_LIST;
 					cl.indent = eff_indent;
+					cl.list_marker = marker;
 					cl.content = line + ws_bytes + 2;
 					cl.content_length =
 						len - ws_bytes - 2;
@@ -1230,6 +1303,7 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 		    i + 1 < len && line[i + 1] == ' ') {
 			cl.type = LINE_ORDERED_LIST;
 			cl.indent = eff_indent;
+			cl.list_marker = line[i]; /* '.' or ')' */
 			/* Parse the number. */
 			cl.ordered_number = 0;
 			for (size_t j = ws_bytes; j < i; j++)
@@ -1919,35 +1993,56 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 				while (paren < length && text[paren] == ' ')
 					paren++;
 				size_t url_begin = paren;
-				int paren_depth = 0;
-				while (paren < length) {
-					if (text[paren] == '(')
-						paren_depth++;
-					else if (text[paren] == ')') {
-						if (paren_depth > 0)
-							paren_depth--;
-						else
+				/* Angle-bracket URL: <url> */
+				if (paren < length && text[paren] == '<') {
+					paren++; /* skip < */
+					url_begin = paren;
+					while (paren < length &&
+					       text[paren] != '>')
+						paren++;
+					if (paren < length) {
+						url_start = text + url_begin;
+						url_len = paren - url_begin;
+						paren++; /* skip > */
+					} else {
+						/* No closing > — fail. */
+						url_start = text + url_begin;
+						url_len = 0;
+					}
+				} else {
+					int paren_depth = 0;
+					while (paren < length) {
+						if (text[paren] == '(')
+							paren_depth++;
+						else if (text[paren] == ')') {
+							if (paren_depth > 0)
+								paren_depth--;
+							else
+								break;
+						} else if (text[paren] == ' ' ||
+							   text[paren] == '"' ||
+							   text[paren] == '\'')
 							break;
-					} else if (text[paren] == ' ' ||
-						   text[paren] == '"' ||
-						   text[paren] == '\'')
-						break;
-					paren++;
+						paren++;
+					}
+					url_start = text + url_begin;
+					url_len = paren - url_begin;
 				}
-				url_start = text + url_begin;
-				url_len = paren - url_begin;
 				if (paren < length && text[paren] == ' ') {
 					while (paren < length &&
 					       text[paren] == ' ')
 						paren++;
 					if (paren < length &&
 					    (text[paren] == '"' ||
-					     text[paren] == '\'')) {
-						char quote = text[paren];
+					     text[paren] == '\'' ||
+					     text[paren] == '(')) {
+						char open_ch = text[paren];
+						char close_ch = (open_ch == '(')
+							? ')' : open_ch;
 						paren++;
 						size_t ts = paren;
 						while (paren < length &&
-						       text[paren] != quote)
+						       text[paren] != close_ch)
 							paren++;
 						if (paren < length) {
 							title_start =
@@ -2451,10 +2546,12 @@ static void open_list_if_needed(struct md4s_parser *p,
 		struct md4s_detail d = {0};
 		d.ordered = ordered;
 		d.is_tight = true;  /* Optimistic: assume tight. */
+		d.item_number = cl->ordered_number;
 		emit(p, MD4S_LIST_ENTER, &d);
 		p->list_depth = 1;
 		struct list_level *lvl = &p->list_stack[0];
 		lvl->ordered = ordered;
+		lvl->marker_char = cl->list_marker;
 		lvl->marker_indent = cl->indent;
 		lvl->content_indent = content_indent;
 		lvl->item_count = 0;
@@ -2539,6 +2636,66 @@ static void process_table_header(struct md4s_parser *p,
 }
 
 /* ------------------------------------------------------------------ */
+/* Blockquote accumulation and flush                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Flush accumulated blockquote content: emit BLOCKQUOTE_ENTER,
+ * recursively parse the collected lines as a sub-document,
+ * then emit BLOCKQUOTE_LEAVE.
+ */
+static void flush_blockquote(struct md4s_parser *p)
+{
+	if (!p->in_blockquote || p->bq_len == 0) {
+		p->in_blockquote = false;
+		return;
+	}
+
+	emit_simple(p, MD4S_BLOCKQUOTE_ENTER);
+
+	/* Create a sub-parser to process the blockquote content. */
+	struct md4s_parser *sub = md4s_create_ex(
+		p->callback, p->user_data, p->flags);
+	if (sub != NULL) {
+		/* Copy reference link definitions to sub-parser. */
+		for (int i = 0; i < p->link_def_count; i++) {
+			if (sub->link_def_count < MAX_LINK_DEFS) {
+				sub->link_defs[sub->link_def_count].label =
+					strdup(p->link_defs[i].label);
+				sub->link_defs[sub->link_def_count].url =
+					strdup(p->link_defs[i].url);
+				sub->link_def_count++;
+			}
+		}
+		md4s_feed(sub, p->bq_buf, p->bq_len);
+		char *raw = md4s_finalize(sub);
+		free(raw);
+		md4s_destroy(sub);
+	}
+
+	emit_simple(p, MD4S_BLOCKQUOTE_LEAVE);
+
+	p->bq_len = 0;
+	p->in_blockquote = false;
+}
+
+/*
+ * Append a line to the blockquote buffer.
+ */
+static void bq_append_line(struct md4s_parser *p,
+			    const char *content, size_t len)
+{
+	if (p->bq_buf == NULL) {
+		p->bq_cap = 256;
+		p->bq_buf = malloc(p->bq_cap);
+		if (!p->bq_buf) return;
+		p->bq_len = 0;
+	}
+	buf_append(&p->bq_buf, &p->bq_len, &p->bq_cap, content, len);
+	buf_append(&p->bq_buf, &p->bq_len, &p->bq_cap, "\n", 1);
+}
+
+/* ------------------------------------------------------------------ */
 /* Process a single completed line                                    */
 /* ------------------------------------------------------------------ */
 
@@ -2613,8 +2770,10 @@ static void process_line(struct md4s_parser *p, const char *line,
 		p->list_item_blank_pending = false;
 	}
 
-	/* Paragraph interruption rules (CommonMark spec). */
-	if (in_open_paragraph(p)) {
+	/* Paragraph interruption rules (CommonMark spec).
+	 * Check was_paragraph too (set when paragraph was just closed
+	 * before process_line, e.g. after deferred line flush). */
+	if (in_open_paragraph(p) || p->was_paragraph) {
 		/* Rule 1: Ordered list with start != 1 cannot interrupt. */
 		if (cl.type == LINE_ORDERED_LIST && cl.ordered_number != 1) {
 			cl.type = LINE_PARAGRAPH;
@@ -2653,13 +2812,10 @@ static void process_line(struct md4s_parser *p, const char *line,
 	/* Lazy blockquote continuation: paragraph after blockquote
 	 * continues the blockquote without '>' prefix. */
 	if (cl.type == LINE_PARAGRAPH &&
-	    p->last_type == LINE_BLOCKQUOTE && !p->needs_separator) {
-		/* Treat as blockquote continuation. */
-		emit_simple(p, MD4S_BLOCKQUOTE_ENTER);
-		parse_inline(p, cl.content, cl.content_length);
-		emit_simple(p, MD4S_BLOCKQUOTE_LEAVE);
-		emit_simple(p, MD4S_NEWLINE);
-		/* Keep last_type as BLOCKQUOTE for further continuation. */
+	    p->last_type == LINE_BLOCKQUOTE && !p->needs_separator &&
+	    p->in_blockquote) {
+		/* Append to blockquote buffer as continuation. */
+		bq_append_line(p, cl.content, cl.content_length);
 		p->emitted_count++;
 		p->needs_separator = false;
 		return;
@@ -2668,6 +2824,12 @@ static void process_line(struct md4s_parser *p, const char *line,
 	/* Close indented code block when transitioning to other types. */
 	if (p->last_type == LINE_INDENTED_CODE &&
 	    cl.type != LINE_INDENTED_CODE && cl.type != LINE_BLANK) {
+		/* Discard trailing blank lines (they're deferred). */
+		for (int bi = 0; bi < p->icode_pending_blanks && bi < 16; bi++) {
+			free(p->icode_pending_content[bi]);
+			p->icode_pending_content[bi] = NULL;
+		}
+		p->icode_pending_blanks = 0;
 		emit_simple(p, MD4S_CODE_BLOCK_LEAVE);
 		emit_simple(p, MD4S_NEWLINE);
 		p->needs_separator = true;
@@ -2675,24 +2837,15 @@ static void process_line(struct md4s_parser *p, const char *line,
 
 	/* Setext heading detection: if we have an open paragraph and
 	 * the current line is a setext underline, convert to heading.
-	 * Per CommonMark, setext heading takes priority over thematic break. */
+	 * Per CommonMark, setext heading takes priority over thematic break.
+	 * Note: single-line setext is handled in md4s_feed before
+	 * close_paragraph fires. This fallback handles edge cases. */
 	if (p->last_type == LINE_PARAGRAPH && p->emitted_count > 0 &&
-	    !p->needs_separator) {
+	    !p->needs_separator && !p->paragraph_closed) {
 		size_t slen = strip_newline(line, raw_len);
 		int setext = is_setext_underline(line, slen);
 		if (setext > 0) {
-			/* The paragraph's content was already emitted.
-			 * Replace PARAGRAPH with HEADING: emit leave for
-			 * the paragraph block, then heading enter/leave
-			 * with no content (consumer uses the paragraph text). */
-			emit_simple(p, MD4S_PARAGRAPH_LEAVE);
-			emit_simple(p, MD4S_NEWLINE);
-			/* Now emit a heading marker event. The heading level
-			 * is signaled, and since we can't re-emit content,
-			 * we rely on consumers to retroactively interpret
-			 * the preceding paragraph as heading content.
-			 * For practical purposes (LLM streaming), we emit
-			 * HEADING_ENTER/LEAVE to indicate the level. */
+			close_paragraph(p);
 			struct md4s_detail d = {0};
 			d.heading_level = setext;
 			emit(p, MD4S_HEADING_ENTER, &d);
@@ -2703,6 +2856,22 @@ static void process_line(struct md4s_parser *p, const char *line,
 			return;
 		}
 	}
+
+	/* Flush accumulated blockquote when transitioning to non-bq. */
+	if (p->in_blockquote && cl.type != LINE_BLOCKQUOTE) {
+		flush_blockquote(p);
+		p->needs_separator = true;
+	}
+
+	/* Clear was_paragraph after interruption rules have used it. */
+	p->was_paragraph = false;
+
+	/* Close any open paragraph before processing non-paragraph
+	 * lines. This is done here (after interruption rules have
+	 * had a chance to reclassify the line) instead of in
+	 * md4s_feed, to ensure correct paragraph continuations. */
+	if (cl.type != LINE_PARAGRAPH)
+		close_paragraph(p);
 
 	switch (cl.type) {
 	case LINE_BLANK:
@@ -2716,10 +2885,23 @@ static void process_line(struct md4s_parser *p, const char *line,
 			p->needs_separator = true;
 			break;
 		}
-		/* Blank lines inside indented code emit empty code line. */
+		/* Blank lines inside indented code: defer emission.
+		 * Per CommonMark, trailing blank lines are not part
+		 * of the code block, so we count them and only emit
+		 * when followed by more code. */
 		if (p->last_type == LINE_INDENTED_CODE) {
-			emit_text(p, MD4S_CODE_TEXT, "", 0);
-			emit_simple(p, MD4S_NEWLINE);
+			if (p->icode_pending_blanks < 16) {
+				size_t slen = strip_newline(line, raw_len);
+				if (slen >= 4)
+					p->icode_pending_content[
+						p->icode_pending_blanks] =
+						strndup(line + 4, slen - 4);
+				else
+					p->icode_pending_content[
+						p->icode_pending_blanks] =
+						strdup("");
+			}
+			p->icode_pending_blanks++;
 			break;
 		}
 		/* Track blank lines for loose/tight list detection. */
@@ -2800,11 +2982,11 @@ static void process_line(struct md4s_parser *p, const char *line,
 	case LINE_BLOCKQUOTE:
 		close_table_if_needed(p);
 		close_list_if_needed(p, cl.type);
-		maybe_emit_separator(p, &cl);
-		emit_simple(p, MD4S_BLOCKQUOTE_ENTER);
-		parse_inline(p, cl.content, cl.content_length);
-		emit_simple(p, MD4S_BLOCKQUOTE_LEAVE);
-		emit_simple(p, MD4S_NEWLINE);
+		if (!p->in_blockquote)
+			maybe_emit_separator(p, &cl);
+		/* Accumulate blockquote content for recursive parsing. */
+		p->in_blockquote = true;
+		bq_append_line(p, cl.content, cl.content_length);
 		p->emitted_count++;
 		p->last_type = LINE_BLOCKQUOTE;
 		p->needs_separator = false;
@@ -2828,11 +3010,13 @@ static void process_line(struct md4s_parser *p, const char *line,
 				struct md4s_detail d = {0};
 				d.ordered = ordered;
 				d.is_tight = true;
+				d.item_number = cl.ordered_number;
 				emit(p, MD4S_LIST_ENTER, &d);
 				p->list_depth++;
 				struct list_level *nlvl =
 					&p->list_stack[p->list_depth - 1];
 				nlvl->ordered = ordered;
+				nlvl->marker_char = cl.list_marker;
 				nlvl->marker_indent = cl.indent;
 				nlvl->content_indent = content_indent;
 				nlvl->item_count = 0;
@@ -2851,8 +3035,9 @@ static void process_line(struct md4s_parser *p, const char *line,
 					p->list_depth--;
 				}
 				cur = &p->list_stack[p->list_depth - 1];
-				/* Check for list type change. */
-				if (cur->ordered != ordered) {
+				/* Check for list type/marker change. */
+				if (cur->ordered != ordered ||
+				    cur->marker_char != cl.list_marker) {
 					close_list_item(p);
 					emit_simple(p, MD4S_LIST_LEAVE);
 					p->list_depth--;
@@ -2862,9 +3047,12 @@ static void process_line(struct md4s_parser *p, const char *line,
 					/* Sibling item in this list. */
 					close_list_item(p);
 				}
-			} else if (cur->ordered != ordered) {
-				/* Same indent but type change: close old
-				 * list, open new one. */
+			} else if (cur->ordered != ordered ||
+				   cur->marker_char != cl.list_marker) {
+				/* Same indent but type/marker change:
+				 * close old list, open new one. Per
+				 * CommonMark, different markers (-, +, *)
+				 * create separate lists. */
 				close_list_item(p);
 				emit_simple(p, MD4S_LIST_LEAVE);
 				p->list_depth--;
@@ -2937,6 +3125,20 @@ static void process_line(struct md4s_parser *p, const char *line,
 			struct md4s_detail d = {0};
 			emit(p, MD4S_CODE_BLOCK_ENTER, &d);
 		}
+		/* Emit any deferred blank lines (they were not
+		 * trailing since more code follows). */
+		for (int bi = 0; bi < p->icode_pending_blanks && bi < 16; bi++) {
+			char *bc = p->icode_pending_content[bi];
+			if (bc) {
+				emit_text(p, MD4S_CODE_TEXT, bc, strlen(bc));
+				free(bc);
+				p->icode_pending_content[bi] = NULL;
+			} else {
+				emit_text(p, MD4S_CODE_TEXT, "", 0);
+			}
+			emit_simple(p, MD4S_NEWLINE);
+		}
+		p->icode_pending_blanks = 0;
 		emit_text(p, MD4S_CODE_TEXT, cl.content,
 			  cl.content_length);
 		emit_simple(p, MD4S_NEWLINE);
@@ -2998,7 +3200,7 @@ static void process_line(struct md4s_parser *p, const char *line,
 		}
 		/* Consecutive paragraph lines: softbreak or hardbreak. */
 		if (p->last_type == LINE_PARAGRAPH && !p->needs_separator &&
-		    p->emitted_count > 0) {
+		    p->emitted_count > 0 && !p->paragraph_closed) {
 			if (p->hard_break_pending) {
 				emit_simple(p, MD4S_HARDBREAK);
 				p->hard_break_pending = false;
@@ -3010,6 +3212,7 @@ static void process_line(struct md4s_parser *p, const char *line,
 			p->hard_break_pending = false;
 			maybe_emit_separator(p, &cl);
 			emit_simple(p, MD4S_PARAGRAPH_ENTER);
+			p->paragraph_closed = false;
 			parse_inline(p, cl.content, cl.content_length);
 		}
 		/* Check for trailing hard break indicators. */
@@ -3040,9 +3243,12 @@ static void process_line(struct md4s_parser *p, const char *line,
  */
 static void close_paragraph(struct md4s_parser *p)
 {
-	if (p->last_type == LINE_PARAGRAPH && p->emitted_count > 0) {
+	if (p->last_type == LINE_PARAGRAPH && p->emitted_count > 0 &&
+	    !p->paragraph_closed) {
 		emit_simple(p, MD4S_PARAGRAPH_LEAVE);
 		emit_simple(p, MD4S_NEWLINE);
+		p->paragraph_closed = true;
+		p->was_paragraph = true;
 	}
 }
 
@@ -3109,13 +3315,15 @@ void md4s_feed(struct md4s_parser *parser, const char *data, size_t length)
 					       (parser->deferred_line[hlen - 1] == '\n' ||
 						parser->deferred_line[hlen - 1] == '\r'))
 						hlen--;
-					/* Trim leading/trailing spaces. */
+					/* Trim leading/trailing whitespace. */
 					const char *htext = parser->deferred_line;
-					while (hlen > 0 && htext[0] == ' ') {
+					while (hlen > 0 && (htext[0] == ' ' ||
+					       htext[0] == '\t')) {
 						htext++;
 						hlen--;
 					}
-					while (hlen > 0 && htext[hlen - 1] == ' ')
+					while (hlen > 0 && (htext[hlen - 1] == ' ' ||
+					       htext[hlen - 1] == '\t'))
 						hlen--;
 					struct classified_line fcl = {
 						.type = LINE_HEADING};
@@ -3136,10 +3344,13 @@ void md4s_feed(struct md4s_parser *parser, const char *data, size_t length)
 					continue;
 				}
 
-				/* Check for table separator. */
+				/* Check for table separator (only when
+				 * tables are enabled). */
 				int dummy[TABLE_MAX_COLUMNS] = {0};
-				int ncols = parse_table_separator(
-					parser->line_buf, slen, dummy);
+				int ncols = (parser->flags & MD4S_FLAG_TABLES)
+					? parse_table_separator(
+						parser->line_buf, slen, dummy)
+					: 0;
 				if (ncols > 0) {
 					/* Check deferred line has pipes. */
 					bool has_pipe = false;
@@ -3165,17 +3376,58 @@ void md4s_feed(struct md4s_parser *parser, const char *data, size_t length)
 					}
 				}
 
-				/* Neither — flush deferred as normal. */
-				char *dl = parser->deferred_line;
-				size_t dlen = parser->deferred_len;
-				parser->deferred_line = NULL;
-				parser->deferred_len = 0;
-				struct classified_line dcl = classify_line(
-					parser, dl, dlen);
-				if (dcl.type != LINE_PARAGRAPH)
-					close_paragraph(parser);
-				process_line(parser, dl, dlen);
-				free(dl);
+				/* Check if current line is a paragraph
+				 * continuation. If so, append to deferred
+				 * buffer for multi-line setext support. */
+				struct classified_line ccl = classify_line(
+					parser, parser->line_buf,
+					parser->line_len);
+				if (ccl.type == LINE_PARAGRAPH &&
+				    parser->state == STATE_NORMAL &&
+				    !parser->in_table) {
+					/* Append current line to deferred. */
+					size_t newlen = parser->deferred_len +
+						parser->line_len;
+					char *newbuf = realloc(
+						parser->deferred_line,
+						newlen + 1);
+					if (newbuf) {
+						memcpy(newbuf +
+						       parser->deferred_len,
+						       parser->line_buf,
+						       parser->line_len);
+						newbuf[newlen] = '\0';
+						parser->deferred_line = newbuf;
+						parser->deferred_len = newlen;
+					}
+					parser->line_len = 0;
+					continue;
+				}
+
+				/* Not a continuation — flush deferred as
+				 * normal. Process each line individually
+				 * to preserve softbreaks/hardbreaks. */
+				{
+					char *dl = parser->deferred_line;
+					size_t dlen = parser->deferred_len;
+					parser->deferred_line = NULL;
+					parser->deferred_len = 0;
+					/* Process each line in the buffer. */
+					size_t off = 0;
+					while (off < dlen) {
+						size_t end = off;
+						while (end < dlen &&
+						       dl[end] != '\n')
+							end++;
+						if (end < dlen)
+							end++; /* include \n */
+						process_line(parser,
+							     dl + off,
+							     end - off);
+						off = end;
+					}
+					free(dl);
+				}
 			}
 
 			struct classified_line cl = classify_line(
@@ -3203,35 +3455,30 @@ void md4s_feed(struct md4s_parser *parser, const char *data, size_t length)
 				close_table_if_needed(parser);
 			}
 
-			/* Defer pipe-containing paragraph lines for
-			 * table detection (only when tables enabled). */
-			if ((parser->flags & MD4S_FLAG_TABLES) &&
-			    cl.type == LINE_PARAGRAPH &&
+			/* Defer first paragraph line for setext/table
+			 * lookahead. A paragraph line that starts a new
+			 * paragraph (not a continuation) is deferred so
+			 * the next line can be checked for setext
+			 * underlines or table separators. */
+			if (cl.type == LINE_PARAGRAPH &&
 			    parser->state == STATE_NORMAL &&
-			    !parser->in_table) {
-				bool has_pipe = false;
-				for (size_t k = 0;
-				     k < parser->line_len; k++) {
-					if (parser->line_buf[k] == '|') {
-						has_pipe = true;
-						break;
-					}
-				}
-				if (has_pipe) {
-					parser->deferred_line =
-						strndup(parser->line_buf,
-							parser->line_len);
-					parser->deferred_len =
-						parser->line_len;
-					parser->line_len = 0;
-					continue;
-				}
+			    !parser->in_table &&
+			    parser->deferred_line == NULL &&
+			    (parser->last_type != LINE_PARAGRAPH ||
+			     parser->needs_separator ||
+			     parser->emitted_count == 0)) {
+				parser->deferred_line =
+					strndup(parser->line_buf,
+						parser->line_len);
+				parser->deferred_len =
+					parser->line_len;
+				parser->line_len = 0;
+				continue;
 			}
 
-			if (cl.type != LINE_PARAGRAPH)
-				close_paragraph(parser);
-
-			/* Process the completed line. */
+			/* Process the completed line. process_line handles
+			 * paragraph closing internally so interruption
+			 * rules can fire before the paragraph is closed. */
 			process_line(parser, parser->line_buf,
 				     parser->line_len);
 			parser->line_len = 0;
@@ -3304,18 +3551,26 @@ char *md4s_finalize(struct md4s_parser *parser)
 		parser->partial_displayed = false;
 	}
 
-	/* Flush any deferred line (table lookahead). */
+	/* Flush any deferred line(s) (table/setext lookahead).
+	 * The buffer may contain multiple lines if paragraph
+	 * continuation lines were accumulated. Process each
+	 * line individually to preserve softbreaks. */
 	if (parser->deferred_line != NULL) {
-		struct classified_line dcl = classify_line(
-			parser, parser->deferred_line,
-			parser->deferred_len);
-		if (dcl.type != LINE_PARAGRAPH)
-			close_paragraph(parser);
-		process_line(parser, parser->deferred_line,
-			     parser->deferred_len);
-		free(parser->deferred_line);
+		char *dl = parser->deferred_line;
+		size_t dlen = parser->deferred_len;
 		parser->deferred_line = NULL;
 		parser->deferred_len = 0;
+		size_t off = 0;
+		while (off < dlen) {
+			size_t end = off;
+			while (end < dlen && dl[end] != '\n')
+				end++;
+			if (end < dlen)
+				end++; /* include \n */
+			process_line(parser, dl + off, end - off);
+			off = end;
+		}
+		free(dl);
 	}
 
 	/* Flush remaining line buffer as a completed line. */
@@ -3337,6 +3592,10 @@ char *md4s_finalize(struct md4s_parser *parser)
 
 	/* Close any open paragraph. */
 	close_paragraph(parser);
+
+	/* Flush any open blockquote. */
+	if (parser->in_blockquote)
+		flush_blockquote(parser);
 
 	/* Close any open indented code block. */
 	if (parser->last_type == LINE_INDENTED_CODE) {
@@ -3395,6 +3654,7 @@ void md4s_destroy(struct md4s_parser *parser)
 	free(parser->raw_buf);
 	free(parser->code_language);
 	free(parser->deferred_line);
+	free(parser->bq_buf);
 	for (int i = 0; i < parser->link_def_count; i++) {
 		free(parser->link_defs[i].label);
 		free(parser->link_defs[i].url);
