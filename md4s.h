@@ -104,9 +104,10 @@ enum md4s_event {
 #define MD4S_FLAG_NOHTMLBLOCKS    0x0008  /* Disable HTML blocks */
 #define MD4S_FLAG_NOHTMLSPANS     0x0010  /* Disable inline HTML (<tag>) */
 #define MD4S_FLAG_NOINDENTEDCODE  0x0020  /* Disable indented code blocks */
+#define MD4S_FLAG_GFM_AUTOLINKS  0x0040  /* Bare URL autolinks (default: on) */
 
 #define MD4S_FLAG_DEFAULT  (MD4S_FLAG_TABLES | MD4S_FLAG_STRIKETHROUGH | \
-                            MD4S_FLAG_TASKLISTS)
+                            MD4S_FLAG_TASKLISTS | MD4S_FLAG_GFM_AUTOLINKS)
 
 /* ------------------------------------------------------------------ */
 /* Event detail                                                       */

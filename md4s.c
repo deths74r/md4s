@@ -1791,6 +1791,85 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 			}
 		}
 
+		/* GFM extended autolink: bare http:// or https:// URLs.
+		 * Gated by MD4S_FLAG_GFM_AUTOLINKS.
+		 * Skip if preceded by '<' (angle-bracket autolink). */
+		if ((p->flags & MD4S_FLAG_GFM_AUTOLINKS) &&
+		    text[pos] == 'h' && pos + 8 < length &&
+		    (pos == 0 || text[pos - 1] != '<')) {
+			const char *rest = text + pos;
+			size_t remain = length - pos;
+			size_t scheme_len = 0;
+			if (remain >= 8 &&
+			    rest[0] == 'h' && rest[1] == 't' &&
+			    rest[2] == 't' && rest[3] == 'p' &&
+			    rest[4] == 's' && rest[5] == ':' &&
+			    rest[6] == '/' && rest[7] == '/')
+				scheme_len = 8;
+			else if (remain >= 7 &&
+				 rest[0] == 'h' && rest[1] == 't' &&
+				 rest[2] == 't' && rest[3] == 'p' &&
+				 rest[4] == ':' && rest[5] == '/' &&
+				 rest[6] == '/')
+				scheme_len = 7;
+			if (scheme_len > 0 && scheme_len < remain) {
+				/* Scan for URL end: first whitespace
+				 * or '<' or end of text. */
+				size_t url_end = pos + scheme_len;
+				while (url_end < length &&
+				       text[url_end] != ' ' &&
+				       text[url_end] != '\t' &&
+				       text[url_end] != '\n' &&
+				       text[url_end] != '\r' &&
+				       text[url_end] != '<')
+					url_end++;
+				/* Strip trailing punctuation unless
+				 * balanced parens. */
+				while (url_end > pos + scheme_len) {
+					char last = text[url_end - 1];
+					if (last == '.' || last == ',' ||
+					    last == ';' || last == ':' ||
+					    last == '!' || last == '?' ||
+					    last == '"' || last == '\'') {
+						url_end--;
+						continue;
+					}
+					if (last == ')') {
+						/* Count parens in URL. */
+						int open = 0, close = 0;
+						for (size_t k = pos;
+						     k < url_end; k++) {
+							if (text[k] == '(')
+								open++;
+							else if (text[k] == ')')
+								close++;
+						}
+						if (close > open) {
+							url_end--;
+							continue;
+						}
+					}
+					break;
+				}
+				size_t url_len = url_end - pos;
+				if (url_len > scheme_len) {
+					if (seg_count < seg_cap) {
+						segs[seg_count].type =
+							SEG_AUTOLINK;
+						segs[seg_count].start = pos;
+						segs[seg_count].end = url_end;
+						segs[seg_count].url =
+							text + pos;
+						segs[seg_count].url_len =
+							url_len;
+						seg_count++;
+					}
+					pos = url_end;
+					continue;
+				}
+			}
+		}
+
 		/* Image or Link: ![alt](url) or [text](url). */
 		if (text[pos] == '[' ||
 		    (text[pos] == '!' && pos + 1 < length &&

@@ -4248,3 +4248,118 @@ TEST(md4s_flags_zero_all_off)
 	ASSERT_TRUE(!has_event(&ctx, MD4S_STRIKETHROUGH_ENTER));
 	md4s_destroy(p);
 }
+
+/* ================================================================== */
+/* GFM Extended Autolinks                                              */
+/* ================================================================== */
+
+/* Bare https URL in text → linked */
+TEST(md4s_gfm_autolink_https)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"Visit https://example.com today\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_LINK_ENTER));
+	const struct recorded_event *e = find_event(&ctx,
+		MD4S_LINK_ENTER, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_STRING("https://example.com", e->url);
+	/* Text event with the URL text */
+	const struct recorded_event *t = find_event(&ctx,
+		MD4S_TEXT, 1);
+	ASSERT_NOT_NULL(t);
+	ASSERT_EQUAL_STRING("https://example.com", t->text);
+	ASSERT_TRUE(has_event(&ctx, MD4S_LINK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Bare http URL with path and query → linked */
+TEST(md4s_gfm_autolink_http_path)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"See http://x.com/path?q=1 for info\n");
+	const struct recorded_event *e = find_event(&ctx,
+		MD4S_LINK_ENTER, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_STRING("http://x.com/path?q=1", e->url);
+	md4s_destroy(p);
+}
+
+/* URL followed by period → period stripped */
+TEST(md4s_gfm_autolink_trailing_punct)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"Go to https://example.com.\n");
+	const struct recorded_event *e = find_event(&ctx,
+		MD4S_LINK_ENTER, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_STRING("https://example.com", e->url);
+	md4s_destroy(p);
+}
+
+/* URL in angle brackets still works as before */
+TEST(md4s_gfm_autolink_angle_brackets)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<https://example.com>\n");
+	const struct recorded_event *e = find_event(&ctx,
+		MD4S_LINK_ENTER, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_STRING("https://example.com", e->url);
+	md4s_destroy(p);
+}
+
+/* URL in code span → NOT linked */
+TEST(md4s_gfm_autolink_in_code_span)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"`https://example.com`\n");
+	ASSERT_TRUE(!has_event(&ctx, MD4S_LINK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_CODE_SPAN_ENTER));
+	md4s_destroy(p);
+}
+
+/* URL without scheme → NOT linked */
+TEST(md4s_gfm_autolink_no_scheme)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"Visit example.com today\n");
+	ASSERT_TRUE(!has_event(&ctx, MD4S_LINK_ENTER));
+	md4s_destroy(p);
+}
+
+/* URL gated by flag (disabled when flag not set) */
+TEST(md4s_gfm_autolink_flag_disabled)
+{
+	struct recorder_ctx ctx = {0};
+	/* Use flags without GFM_AUTOLINKS */
+	unsigned int flags = MD4S_FLAG_TABLES | MD4S_FLAG_STRIKETHROUGH |
+		MD4S_FLAG_TASKLISTS;
+	struct md4s_parser *p = feed_and_finalize_ex(&ctx,
+		"Visit https://example.com today\n", flags);
+	ASSERT_TRUE(!has_event(&ctx, MD4S_LINK_ENTER));
+	md4s_destroy(p);
+}
+
+/* Multiple URLs in one line */
+TEST(md4s_gfm_autolink_multiple)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"See https://a.com and https://b.com here\n");
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LINK_ENTER));
+	const struct recorded_event *e1 = find_event(&ctx,
+		MD4S_LINK_ENTER, 0);
+	ASSERT_NOT_NULL(e1);
+	ASSERT_EQUAL_STRING("https://a.com", e1->url);
+	const struct recorded_event *e2 = find_event(&ctx,
+		MD4S_LINK_ENTER, 1);
+	ASSERT_NOT_NULL(e2);
+	ASSERT_EQUAL_STRING("https://b.com", e2->url);
+	md4s_destroy(p);
+}
