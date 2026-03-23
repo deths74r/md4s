@@ -115,6 +115,9 @@ struct md4s_parser {
 	/* Whether a partial line is currently displayed. */
 	bool partial_displayed;
 
+	/* Hard break: pending from previous paragraph line. */
+	bool hard_break_pending;
+
 	/* Table tracking. */
 	bool in_table;
 	int table_columns;
@@ -764,12 +767,14 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 
 	/* Inside a fenced code block. */
 	if (p->state == STATE_FENCED_CODE) {
-		/* Check for closing fence. */
-		int n = count_leading(line, len, p->fence_char);
+		/* Check for closing fence (allow 0-3 leading spaces). */
+		size_t fi = count_leading_spaces(line, len);
+		if (fi > 3) fi = 0;
+		int n = count_leading(line + fi, len - fi, p->fence_char);
 		if (n >= p->fence_length) {
-			/* Rest must be whitespace only. */
 			bool rest_blank = is_all_whitespace(
-				line + n, len - (size_t)n);
+				line + fi + (size_t)n,
+				len - fi - (size_t)n);
 			if (rest_blank) {
 				cl.type = LINE_FENCE_CLOSE;
 				return cl;
@@ -799,16 +804,22 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 		return cl;
 	}
 
+	/* Skip up to 3 leading spaces for block constructs. */
+	size_t indent = count_leading_spaces(line, len);
+	if (indent > 3) indent = 0; /* 4+ = indented code, don't skip */
+	const char *lp = line + indent;
+	size_t llen = len - indent;
+
 	/* Fence open: 3+ backticks or tildes. */
-	if (len >= 3 && (line[0] == '`' || line[0] == '~')) {
-		char ch = line[0];
-		int n = count_leading(line, len, ch);
+	if (llen >= 3 && (lp[0] == '`' || lp[0] == '~')) {
+		char ch = lp[0];
+		int n = count_leading(lp, llen, ch);
 		if (n >= 3) {
 			bool valid = true;
 			/* Backtick fences: info string must not contain backticks. */
 			if (ch == '`') {
-				for (size_t i = (size_t)n; i < len; i++) {
-					if (line[i] == '`') {
+				for (size_t i = (size_t)n; i < llen; i++) {
+					if (lp[i] == '`') {
 						valid = false;
 						break;
 					}
@@ -819,8 +830,8 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 				cl.fence_char = ch;
 				cl.fence_length = n;
 				/* Extract info string (trim whitespace). */
-				const char *info = line + n;
-				size_t info_len = len - (size_t)n;
+				const char *info = lp + n;
+				size_t info_len = llen - (size_t)n;
 				while (info_len > 0 && info[0] == ' ') {
 					info++;
 					info_len--;
@@ -836,14 +847,14 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 	}
 
 	/* ATX heading: 1-6 '#' followed by space or end. */
-	if (line[0] == '#') {
-		int level = count_leading(line, len, '#');
+	if (lp[0] == '#') {
+		int level = count_leading(lp, llen, '#');
 		if (level >= 1 && level <= 6 &&
-		    ((size_t)level == len || line[level] == ' ')) {
+		    ((size_t)level == llen || lp[level] == ' ')) {
 			cl.type = LINE_HEADING;
 			cl.heading_level = level;
-			cl.content = line + level;
-			cl.content_length = len - (size_t)level;
+			cl.content = lp + level;
+			cl.content_length = llen - (size_t)level;
 			if (cl.content_length > 0 && cl.content[0] == ' ') {
 				cl.content++;
 				cl.content_length--;
@@ -866,10 +877,10 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 	}
 
 	/* Blockquote: starts with '>'. */
-	if (line[0] == '>') {
+	if (lp[0] == '>') {
 		cl.type = LINE_BLOCKQUOTE;
-		cl.content = line + 1;
-		cl.content_length = len - 1;
+		cl.content = lp + 1;
+		cl.content_length = llen - 1;
 		if (cl.content_length > 0 && cl.content[0] == ' ') {
 			cl.content++;
 			cl.content_length--;
@@ -1115,45 +1126,65 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 			}
 		}
 
-		/* HTML entity decoding. */
-		if (text[pos] == '&') {
-			/* Find the semicolon. */
-			size_t semi = pos + 1;
-			while (semi < length && semi < pos + 10 &&
-			       text[semi] != ';')
-				semi++;
-			if (semi < length && text[semi] == ';') {
-				size_t ent_len = semi - pos + 1;
-				const char *replacement = NULL;
-				if (ent_len == 5 &&
-				    memcmp(text + pos, "&amp;", 5) == 0)
-					replacement = "&";
-				else if (ent_len == 4 &&
-					 memcmp(text + pos, "&lt;", 4) == 0)
-					replacement = "<";
-				else if (ent_len == 4 &&
-					 memcmp(text + pos, "&gt;", 4) == 0)
-					replacement = ">";
-				else if (ent_len == 6 &&
-					 memcmp(text + pos, "&quot;", 6) == 0)
-					replacement = "\"";
-				else if (ent_len == 6 &&
-					 memcmp(text + pos, "&apos;", 6) == 0)
-					replacement = "'";
-				else if (ent_len == 6 &&
-					 memcmp(text + pos, "&nbsp;", 6) == 0)
-					replacement = " ";
-				if (replacement != NULL) {
-					if (pos > plain_start)
-						emit_text(p, MD4S_TEXT,
-							  text + plain_start,
-							  pos - plain_start);
-					emit_text(p, MD4S_TEXT, replacement,
-						  strlen(replacement));
-					pos = semi + 1;
-					plain_start = pos;
-					continue;
+		/* Entity/character reference: &name; &#digits; &#xhex; */
+		if (text[pos] == '&' && pos + 2 < length) {
+			size_t estart = pos + 1;
+			bool valid = false;
+			if (text[estart] == '#') {
+				/* Numeric: &#digits; or &#xhex; */
+				size_t nstart = estart + 1;
+				if (nstart < length &&
+				    (text[nstart] == 'x' ||
+				     text[nstart] == 'X')) {
+					/* Hex: &#x[0-9a-fA-F]{1,6}; */
+					size_t d = nstart + 1;
+					while (d < length && d < nstart + 7 &&
+					       ((text[d] >= '0' && text[d] <= '9') ||
+						(text[d] >= 'a' && text[d] <= 'f') ||
+						(text[d] >= 'A' && text[d] <= 'F')))
+						d++;
+					if (d > nstart + 1 && d < length &&
+					    text[d] == ';')
+						valid = true;
+				} else {
+					/* Decimal: &#[0-9]{1,7}; */
+					size_t d = nstart;
+					while (d < length && d < nstart + 7 &&
+					       text[d] >= '0' && text[d] <= '9')
+						d++;
+					if (d > nstart && d < length &&
+					    text[d] == ';')
+						valid = true;
 				}
+			} else if ((text[estart] >= 'A' &&
+				    text[estart] <= 'Z') ||
+				   (text[estart] >= 'a' &&
+				    text[estart] <= 'z')) {
+				/* Named: &[A-Za-z][A-Za-z0-9]{0,47}; */
+				size_t d = estart + 1;
+				while (d < length && d < estart + 48 &&
+				       ((text[d] >= 'A' && text[d] <= 'Z') ||
+					(text[d] >= 'a' && text[d] <= 'z') ||
+					(text[d] >= '0' && text[d] <= '9')))
+					d++;
+				if (d > estart && d < length &&
+				    text[d] == ';')
+					valid = true;
+			}
+			if (valid) {
+				/* Find the semicolon position. */
+				size_t semi = estart;
+				while (semi < length && text[semi] != ';')
+					semi++;
+				if (pos > plain_start)
+					emit_text(p, MD4S_TEXT,
+						  text + plain_start,
+						  pos - plain_start);
+				emit_text(p, MD4S_ENTITY,
+					  text + pos, semi - pos + 1);
+				pos = semi + 1;
+				plain_start = pos;
+				continue;
 			}
 		}
 
@@ -1173,8 +1204,26 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 						  text + plain_start,
 						  start - plain_start);
 				emit_simple(p, MD4S_CODE_SPAN_ENTER);
-				emit_text(p, MD4S_TEXT, text + pos,
-					  close - pos);
+				/* CommonMark: strip one leading + trailing
+				 * space if both present AND content is not
+				 * entirely spaces. */
+				const char *cs = text + pos;
+				size_t cs_len = close - pos;
+				if (cs_len >= 2 && cs[0] == ' ' &&
+				    cs[cs_len - 1] == ' ') {
+					bool all_spaces = true;
+					for (size_t si = 0; si < cs_len; si++) {
+						if (cs[si] != ' ') {
+							all_spaces = false;
+							break;
+						}
+					}
+					if (!all_spaces) {
+						cs++;
+						cs_len -= 2;
+					}
+				}
+				emit_text(p, MD4S_TEXT, cs, cs_len);
 				emit_simple(p, MD4S_CODE_SPAN_LEAVE);
 				pos = close + (size_t)ticks;
 				plain_start = pos;
@@ -1319,6 +1368,124 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 			}
 		}
 
+		/* Inline HTML: <tag>, </tag>, <!-- -->, <? ?>, etc. */
+		if (text[pos] == '<' && pos + 1 < length) {
+			size_t hstart = pos + 1;
+			size_t hend = 0;
+			bool is_html = false;
+			/* Comment: <!-- ... --> */
+			if (hstart + 2 < length && text[hstart] == '!' &&
+			    text[hstart + 1] == '-' &&
+			    text[hstart + 2] == '-') {
+				size_t s = hstart + 3;
+				while (s + 2 < length) {
+					if (text[s] == '-' &&
+					    text[s + 1] == '-' &&
+					    text[s + 2] == '>') {
+						hend = s + 3;
+						is_html = true;
+						break;
+					}
+					s++;
+				}
+			}
+			/* Processing instruction: <? ... ?> */
+			else if (text[hstart] == '?') {
+				size_t s = hstart + 1;
+				while (s + 1 < length) {
+					if (text[s] == '?' &&
+					    text[s + 1] == '>') {
+						hend = s + 2;
+						is_html = true;
+						break;
+					}
+					s++;
+				}
+			}
+			/* Closing tag: </tagname> */
+			else if (text[hstart] == '/' &&
+				 hstart + 1 < length &&
+				 ((text[hstart + 1] >= 'a' &&
+				   text[hstart + 1] <= 'z') ||
+				  (text[hstart + 1] >= 'A' &&
+				   text[hstart + 1] <= 'Z'))) {
+				size_t s = hstart + 2;
+				while (s < length &&
+				       ((text[s] >= 'a' && text[s] <= 'z') ||
+					(text[s] >= 'A' && text[s] <= 'Z') ||
+					(text[s] >= '0' && text[s] <= '9') ||
+					text[s] == '-'))
+					s++;
+				while (s < length && text[s] == ' ')
+					s++;
+				if (s < length && text[s] == '>') {
+					hend = s + 1;
+					is_html = true;
+				}
+			}
+			/* Open tag: <tagname ...> or <tagname/>
+			 * But NOT autolinks — skip if content has :// or @ */
+			else if ((text[hstart] >= 'a' &&
+				  text[hstart] <= 'z') ||
+				 (text[hstart] >= 'A' &&
+				  text[hstart] <= 'Z')) {
+				/* Quick check: scan for :// or @ to skip autolinks */
+				bool looks_like_url = false;
+				for (size_t ck = hstart; ck < length &&
+				     text[ck] != '>'; ck++) {
+					if (text[ck] == '@') {
+						looks_like_url = true;
+						break;
+					}
+					if (ck + 2 < length &&
+					    text[ck] == ':' &&
+					    text[ck + 1] == '/' &&
+					    text[ck + 2] == '/') {
+						looks_like_url = true;
+						break;
+					}
+				}
+				if (looks_like_url)
+					goto skip_inline_html;
+				size_t s = hstart + 1;
+				while (s < length &&
+				       ((text[s] >= 'a' && text[s] <= 'z') ||
+					(text[s] >= 'A' && text[s] <= 'Z') ||
+					(text[s] >= '0' && text[s] <= '9') ||
+					text[s] == '-'))
+					s++;
+				/* Skip attributes. */
+				while (s < length && text[s] != '>') {
+					if (text[s] == '\'' || text[s] == '"') {
+						char q = text[s++];
+						while (s < length &&
+						       text[s] != q)
+							s++;
+						if (s < length)
+							s++;
+					} else {
+						s++;
+					}
+				}
+				if (s < length && text[s] == '>') {
+					hend = s + 1;
+					is_html = true;
+				}
+			}
+			if (is_html) {
+				if (pos > plain_start)
+					emit_text(p, MD4S_TEXT,
+						  text + plain_start,
+						  pos - plain_start);
+				emit_text(p, MD4S_HTML_INLINE,
+					  text + pos, hend - pos);
+				pos = hend;
+				plain_start = pos;
+				continue;
+			}
+		}
+
+		skip_inline_html:
 		/* Autolink: <url> or <email>. */
 		if (text[pos] == '<') {
 			size_t close = pos + 1;
@@ -1516,6 +1683,37 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 						plain_start = pos;
 						continue;
 					}
+				}
+			}
+
+			/* Shortcut reference: [text] alone, if defined. */
+			if (bracket < length && text[bracket] == ']') {
+				const char *label =
+					text + bracket_start + 1;
+				size_t label_len =
+					bracket - bracket_start - 1;
+				const char *url = find_link_def(
+					p, label, label_len);
+				if (url != NULL) {
+					if (pos > plain_start)
+						emit_text(p, MD4S_TEXT,
+							  text + plain_start,
+							  pos - plain_start);
+					struct md4s_detail d = {0};
+					d.url = url;
+					d.url_length = strlen(url);
+					emit(p, is_image
+						? MD4S_IMAGE_ENTER
+						: MD4S_LINK_ENTER, &d);
+					parse_inline_depth(p,
+						label, label_len,
+						depth + 1);
+					emit_simple(p, is_image
+						? MD4S_IMAGE_LEAVE
+						: MD4S_LINK_LEAVE);
+					pos = bracket + 1;
+					plain_start = pos;
+					continue;
 				}
 			}
 
@@ -1925,15 +2123,35 @@ static void process_line(struct md4s_parser *p, const char *line,
 			cl.content++;
 			cl.content_length--;
 		}
-		/* Consecutive paragraph lines: softbreak. */
+		/* Consecutive paragraph lines: softbreak or hardbreak. */
 		if (p->last_type == LINE_PARAGRAPH && !p->needs_separator &&
 		    p->emitted_count > 0) {
-			emit_simple(p, MD4S_SOFTBREAK);
+			if (p->hard_break_pending) {
+				emit_simple(p, MD4S_HARDBREAK);
+				p->hard_break_pending = false;
+			} else {
+				emit_simple(p, MD4S_SOFTBREAK);
+			}
 			parse_inline(p, cl.content, cl.content_length);
 		} else {
+			p->hard_break_pending = false;
 			maybe_emit_separator(p, &cl);
 			emit_simple(p, MD4S_PARAGRAPH_ENTER);
 			parse_inline(p, cl.content, cl.content_length);
+		}
+		/* Check for trailing hard break indicators. */
+		{
+			size_t clen = cl.content_length;
+			const char *ct = cl.content;
+			/* Backslash at end of content → hard break. */
+			if (clen > 0 && ct[clen - 1] == '\\') {
+				p->hard_break_pending = true;
+			}
+			/* Two or more trailing spaces → hard break. */
+			else if (clen >= 2 && ct[clen - 1] == ' ' &&
+				 ct[clen - 2] == ' ') {
+				p->hard_break_pending = true;
+			}
 		}
 		/* Don't emit PARAGRAPH_LEAVE yet — next line might continue. */
 		p->emitted_count++;

@@ -1217,140 +1217,122 @@ TEST(md4s_escape_bold)
 }
 
 /* ================================================================== */
-/* Group 15: HTML entity decoding (L534-573)                          */
+/* Group 15: Entity/character references                              */
 /* ================================================================== */
 
-/* &amp; → & */
+/* Named entity → MD4S_ENTITY with raw text */
 TEST(md4s_entity_amp)
 {
 	struct recorder_ctx ctx = {0};
 	struct md4s_parser *p = feed_and_finalize(&ctx, "A &amp; B\n");
-	/* Find the entity-decoded text event */
-	bool found_ampersand = false;
-	for (int i = 0; i < ctx.count; i++) {
-		if (ctx.events[i].event == MD4S_TEXT &&
-		    strcmp(ctx.events[i].text, "&") == 0)
-			found_ampersand = true;
-	}
-	ASSERT_TRUE(found_ampersand);
+	ASSERT_TRUE(has_event(&ctx, MD4S_ENTITY));
+	const struct recorded_event *e = find_event(&ctx, MD4S_ENTITY, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_STRING("&amp;", e->text);
 	md4s_destroy(p);
 }
 
-/* &lt; → < */
 TEST(md4s_entity_lt)
 {
 	struct recorder_ctx ctx = {0};
 	struct md4s_parser *p = feed_and_finalize(&ctx, "&lt;\n");
-	bool found = false;
-	for (int i = 0; i < ctx.count; i++) {
-		if (ctx.events[i].event == MD4S_TEXT &&
-		    strcmp(ctx.events[i].text, "<") == 0)
-			found = true;
-	}
-	ASSERT_TRUE(found);
+	ASSERT_TRUE(has_event(&ctx, MD4S_ENTITY));
+	const struct recorded_event *e = find_event(&ctx, MD4S_ENTITY, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_STRING("&lt;", e->text);
 	md4s_destroy(p);
 }
 
-/* &gt; → > */
 TEST(md4s_entity_gt)
 {
 	struct recorder_ctx ctx = {0};
 	struct md4s_parser *p = feed_and_finalize(&ctx, "&gt;\n");
-	bool found = false;
-	for (int i = 0; i < ctx.count; i++) {
-		if (ctx.events[i].event == MD4S_TEXT &&
-		    strcmp(ctx.events[i].text, ">") == 0)
-			found = true;
-	}
-	ASSERT_TRUE(found);
+	ASSERT_TRUE(has_event(&ctx, MD4S_ENTITY));
+	const struct recorded_event *e = find_event(&ctx, MD4S_ENTITY, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_STRING("&gt;", e->text);
 	md4s_destroy(p);
 }
 
-/* &quot; → " */
 TEST(md4s_entity_quot)
 {
 	struct recorder_ctx ctx = {0};
 	struct md4s_parser *p = feed_and_finalize(&ctx, "&quot;\n");
-	bool found = false;
-	for (int i = 0; i < ctx.count; i++) {
-		if (ctx.events[i].event == MD4S_TEXT &&
-		    strcmp(ctx.events[i].text, "\"") == 0)
-			found = true;
-	}
-	ASSERT_TRUE(found);
+	ASSERT_TRUE(has_event(&ctx, MD4S_ENTITY));
 	md4s_destroy(p);
 }
 
-/* &apos; → ' */
 TEST(md4s_entity_apos)
 {
 	struct recorder_ctx ctx = {0};
 	struct md4s_parser *p = feed_and_finalize(&ctx, "&apos;\n");
-	bool found = false;
-	for (int i = 0; i < ctx.count; i++) {
-		if (ctx.events[i].event == MD4S_TEXT &&
-		    strcmp(ctx.events[i].text, "'") == 0)
-			found = true;
-	}
-	ASSERT_TRUE(found);
+	ASSERT_TRUE(has_event(&ctx, MD4S_ENTITY));
 	md4s_destroy(p);
 }
 
-/* &nbsp; → space */
 TEST(md4s_entity_nbsp)
 {
 	struct recorder_ctx ctx = {0};
 	struct md4s_parser *p = feed_and_finalize(&ctx, "a&nbsp;b\n");
-	bool found_space = false;
-	for (int i = 0; i < ctx.count; i++) {
-		if (ctx.events[i].event == MD4S_TEXT &&
-		    strcmp(ctx.events[i].text, " ") == 0)
-			found_space = true;
-	}
-	ASSERT_TRUE(found_space);
+	ASSERT_TRUE(has_event(&ctx, MD4S_ENTITY));
+	const struct recorded_event *e = find_event(&ctx, MD4S_ENTITY, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_STRING("&nbsp;", e->text);
 	md4s_destroy(p);
 }
 
-/* Unknown entity → literal */
+/* Structurally valid but unknown entity → still MD4S_ENTITY */
 TEST(md4s_entity_unknown)
 {
 	struct recorder_ctx ctx = {0};
 	struct md4s_parser *p = feed_and_finalize(&ctx, "&foo;\n");
-	/* The &foo; should appear as literal text */
-	bool found = false;
-	for (int i = 0; i < ctx.count; i++) {
-		if (ctx.events[i].event == MD4S_TEXT &&
-		    strstr(ctx.events[i].text, "&foo;") != NULL)
-			found = true;
-	}
-	ASSERT_TRUE(found);
+	ASSERT_TRUE(has_event(&ctx, MD4S_ENTITY));
+	const struct recorded_event *e = find_event(&ctx, MD4S_ENTITY, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_STRING("&foo;", e->text);
 	md4s_destroy(p);
 }
 
-/* No semicolon → literal & */
+/* No semicolon → literal text (not an entity) */
 TEST(md4s_entity_no_semicolon)
 {
 	struct recorder_ctx ctx = {0};
 	struct md4s_parser *p = feed_and_finalize(&ctx, "&amp\n");
-	/* Should NOT decode — no semicolon */
-	bool found_amp = false;
-	for (int i = 0; i < ctx.count; i++) {
-		if (ctx.events[i].event == MD4S_TEXT &&
-		    strstr(ctx.events[i].text, "&amp") != NULL)
-			found_amp = true;
-	}
-	ASSERT_TRUE(found_amp);
+	ASSERT_FALSE(has_event(&ctx, MD4S_ENTITY));
 	md4s_destroy(p);
 }
 
-/* Entity too long → literal */
+/* Entity name too long (>48 chars) → literal text */
 TEST(md4s_entity_too_long)
 {
 	struct recorder_ctx ctx = {0};
-	struct md4s_parser *p =
-		feed_and_finalize(&ctx, "&verylongentity;\n");
-	/* Should NOT decode — entity name > 10 chars from & */
-	ASSERT_TRUE(has_event(&ctx, MD4S_TEXT));
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"&abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz;\n");
+	ASSERT_FALSE(has_event(&ctx, MD4S_ENTITY));
+	md4s_destroy(p);
+}
+
+/* Decimal numeric entity */
+TEST(md4s_entity_decimal)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx, "&#8212;\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_ENTITY));
+	const struct recorded_event *e = find_event(&ctx, MD4S_ENTITY, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_STRING("&#8212;", e->text);
+	md4s_destroy(p);
+}
+
+/* Hex numeric entity */
+TEST(md4s_entity_hex)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx, "&#x1F4A9;\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_ENTITY));
+	const struct recorded_event *e = find_event(&ctx, MD4S_ENTITY, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_STRING("&#x1F4A9;", e->text);
 	md4s_destroy(p);
 }
 
@@ -3322,6 +3304,233 @@ TEST(md4s_unicode_star_ignores_boundary)
 		feed_and_finalize(&ctx,
 			"\xe4\xb8\xad*italic*\xe6\x96\x87\n");
 	ASSERT_TRUE(has_event(&ctx, MD4S_ITALIC_ENTER));
+	md4s_destroy(p);
+}
+
+/* ================================================================== */
+/* Group 46: Hard line breaks                                         */
+/* ================================================================== */
+
+/* Trailing spaces → hard break */
+TEST(md4s_hardbreak_trailing_spaces)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"line one  \nline two\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HARDBREAK));
+	ASSERT_FALSE(has_event(&ctx, MD4S_SOFTBREAK));
+	md4s_destroy(p);
+}
+
+/* Backslash at end → hard break */
+TEST(md4s_hardbreak_backslash)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"line one\\\nline two\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HARDBREAK));
+	md4s_destroy(p);
+}
+
+/* Single trailing space → soft break (not hard) */
+TEST(md4s_hardbreak_single_space)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"line one \nline two\n");
+	ASSERT_FALSE(has_event(&ctx, MD4S_HARDBREAK));
+	ASSERT_TRUE(has_event(&ctx, MD4S_SOFTBREAK));
+	md4s_destroy(p);
+}
+
+/* No trailing spaces → soft break */
+TEST(md4s_hardbreak_no_spaces)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"line one\nline two\n");
+	ASSERT_FALSE(has_event(&ctx, MD4S_HARDBREAK));
+	ASSERT_TRUE(has_event(&ctx, MD4S_SOFTBREAK));
+	md4s_destroy(p);
+}
+
+/* ================================================================== */
+/* Group 47: Inline HTML                                              */
+/* ================================================================== */
+
+/* Open tag */
+TEST(md4s_inline_html_open_tag)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"hello <span>world</span>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_INLINE));
+	md4s_destroy(p);
+}
+
+/* Close tag */
+TEST(md4s_inline_html_close_tag)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"end</div>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_INLINE));
+	md4s_destroy(p);
+}
+
+/* Self-closing tag */
+TEST(md4s_inline_html_self_closing)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx, "line<br/>end\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_INLINE));
+	md4s_destroy(p);
+}
+
+/* HTML comment inline */
+TEST(md4s_inline_html_comment)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"before<!-- comment -->after\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_INLINE));
+	md4s_destroy(p);
+}
+
+/* Tag with attributes */
+TEST(md4s_inline_html_attributes)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<span class=\"red\">text</span>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_INLINE));
+	md4s_destroy(p);
+}
+
+/* Not HTML — autolink should still work */
+TEST(md4s_inline_html_autolink_preserved)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<https://example.com>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_LINK_ENTER));
+	ASSERT_FALSE(has_event(&ctx, MD4S_HTML_INLINE));
+	md4s_destroy(p);
+}
+
+/* ================================================================== */
+/* Group 48: Leading space tolerance                                  */
+/* ================================================================== */
+
+/* 1 space before heading */
+TEST(md4s_leading_space_heading_1)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx, " # Title\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HEADING_ENTER));
+	md4s_destroy(p);
+}
+
+/* 3 spaces before heading */
+TEST(md4s_leading_space_heading_3)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx, "   # Title\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HEADING_ENTER));
+	md4s_destroy(p);
+}
+
+/* 4 spaces → indented code, not heading */
+TEST(md4s_leading_space_heading_4)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx, "    # Title\n");
+	ASSERT_FALSE(has_event(&ctx, MD4S_HEADING_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_CODE_BLOCK_ENTER));
+	md4s_destroy(p);
+}
+
+/* 2 spaces before blockquote */
+TEST(md4s_leading_space_blockquote)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx, "  > quote\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_BLOCKQUOTE_ENTER));
+	md4s_destroy(p);
+}
+
+/* 3 spaces before fence */
+TEST(md4s_leading_space_fence)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"   ```\ncode\n   ```\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_CODE_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_CODE_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* ================================================================== */
+/* Group 49: Shortcut reference links                                 */
+/* ================================================================== */
+
+/* Shortcut ref: [text] alone resolves if defined */
+TEST(md4s_shortcut_ref_basic)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"[example]: https://x.com\n\n"
+		"Visit [example].\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_LINK_ENTER));
+	md4s_destroy(p);
+}
+
+/* Shortcut ref: undefined → literal */
+TEST(md4s_shortcut_ref_undefined)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"Just [text] here.\n");
+	ASSERT_FALSE(has_event(&ctx, MD4S_LINK_ENTER));
+	md4s_destroy(p);
+}
+
+/* ================================================================== */
+/* Group 50: Code span space stripping                                */
+/* ================================================================== */
+
+/* Spaces stripped: ` foo ` → foo */
+TEST(md4s_code_span_space_strip)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx, "` foo `\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_CODE_SPAN_ENTER));
+	const struct recorded_event *e = find_event(&ctx, MD4S_TEXT, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_STRING("foo", e->text);
+	md4s_destroy(p);
+}
+
+/* All spaces → NOT stripped: ` ` → ` ` */
+TEST(md4s_code_span_all_spaces)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx, "` `\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_CODE_SPAN_ENTER));
+	const struct recorded_event *e = find_event(&ctx, MD4S_TEXT, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_STRING(" ", e->text);
+	md4s_destroy(p);
+}
+
+/* No leading/trailing space → no strip */
+TEST(md4s_code_span_no_spaces)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx, "`foo`\n");
+	const struct recorded_event *e = find_event(&ctx, MD4S_TEXT, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_STRING("foo", e->text);
 	md4s_destroy(p);
 }
 
