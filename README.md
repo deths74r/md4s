@@ -1,10 +1,8 @@
 # md4s — Markdown for Streaming
 
-A streaming markdown parser for C. Processes markdown incrementally — token by token — and emits semantic events through a callback interface.
+A streaming markdown parser for C. Processes markdown incrementally — token by token — and emits semantic events through a callback interface. Completed lines are parsed once and never revisited, enabling renderers to append output without cursor repositioning or full-document re-rendering.
 
-**No cursor-up. No re-rendering. No batch processing.**
-
-Completed lines are emitted once and never revisited. 94% CommonMark spec compliance. Zero dependencies.
+94% CommonMark spec compliance. Full GFM extensions. Zero dependencies.
 
 ## Why
 
