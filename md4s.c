@@ -47,6 +47,7 @@ static char *md4s_strndup_(const char *s, size_t n)
 #define MAX_INLINE_DEPTH      32
 #define MAX_OLIST_DIGITS      9
 #define MAX_BUFFER_SIZE       (256 * 1024 * 1024)  /* 256 MB */
+#define MAX_LIST_DEPTH        8
 
 /* ------------------------------------------------------------------ */
 /* Internal types                                                     */
@@ -72,6 +73,16 @@ enum line_type {
 	LINE_TABLE_ROW,
 	LINE_HTML_BLOCK,
 	LINE_INDENTED_CODE,
+};
+
+/* Per-level list tracking for the list stack. */
+struct list_level {
+	bool ordered;
+	int marker_indent;     /* Leading spaces before marker */
+	int content_indent;    /* Column where content starts */
+	int item_count;        /* Items emitted at this level */
+	bool saw_blank;        /* Blank line seen between items */
+	bool item_open;        /* An item is open at this level */
 };
 
 #define TABLE_MAX_COLUMNS 64
@@ -107,10 +118,15 @@ struct md4s_parser {
 	int emitted_count;
 	bool needs_separator;
 
-	/* List tracking. */
-	bool in_list;
-	bool list_ordered;
-	int list_depth;  /* Nesting depth (0 = not in list). */
+	/* List stack — replaces flat in_list/list_ordered/list_depth. */
+	struct list_level list_stack[MAX_LIST_DEPTH];
+	int list_depth;  /* 0 = not in any list, 1+ = nesting depth. */
+
+	/* Multi-line list item tracking. */
+	bool in_list_item;
+	int list_item_content_indent;
+	int list_item_marker_indent;
+	bool list_item_blank_pending;  /* Blank line seen, item not yet closed. */
 
 	/* Whether a partial line is currently displayed. */
 	bool partial_displayed;
@@ -1139,7 +1155,7 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 
 	/* Indented code block: 4+ effective indent (tabs expand).
 	 * Not inside list. Disabled by NOINDENTEDCODE flag. */
-	if (!p->in_list && !(p->flags & MD4S_FLAG_NOINDENTEDCODE)) {
+	if (p->list_depth == 0 && !(p->flags & MD4S_FLAG_NOINDENTEDCODE)) {
 		size_t ws_bytes = 0;
 		int eff_indent = count_indent(line, len, &ws_bytes);
 		if (eff_indent >= 4 && ws_bytes > 0) {
@@ -2345,15 +2361,82 @@ static void maybe_emit_separator(struct md4s_parser *p,
 /* List tracking                                                      */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Close the item at the given list level if one is open.
+ */
+static void close_item_at_level(struct md4s_parser *p, int level)
+{
+	if (level < 0 || level >= p->list_depth)
+		return;
+	if (!p->list_stack[level].item_open)
+		return;
+	emit_simple(p, MD4S_LIST_ITEM_LEAVE);
+	emit_simple(p, MD4S_NEWLINE);
+	p->list_stack[level].item_open = false;
+}
+
+/*
+ * Close the innermost open list item (convenience wrapper).
+ */
+static void close_list_item(struct md4s_parser *p)
+{
+	if (p->list_depth > 0)
+		close_item_at_level(p, p->list_depth - 1);
+	p->in_list_item = false;
+	p->list_item_blank_pending = false;
+}
+
+/*
+ * Pop list levels down to target_depth (0 = close all lists).
+ * Closes open items and emits LIST_LEAVE for each popped level.
+ */
+static void close_lists_to_depth(struct md4s_parser *p, int target_depth)
+{
+	while (p->list_depth > target_depth) {
+		/* Close any open item at this level. */
+		close_item_at_level(p, p->list_depth - 1);
+		emit_simple(p, MD4S_LIST_LEAVE);
+		p->list_depth--;
+	}
+	p->in_list_item = false;
+	p->list_item_blank_pending = false;
+	/* If we still have levels open, check if the current level
+	 * has an open item. */
+	if (p->list_depth > 0 &&
+	    p->list_stack[p->list_depth - 1].item_open) {
+		p->in_list_item = true;
+	}
+}
+
 static void close_list_if_needed(struct md4s_parser *p, enum line_type type)
 {
-	if (!p->in_list)
+	if (p->list_depth == 0)
 		return;
 
 	if (type != LINE_UNORDERED_LIST && type != LINE_ORDERED_LIST &&
-	    type != LINE_BLANK)  {
-		emit_simple(p, MD4S_LIST_LEAVE);
-		p->in_list = false;
+	    type != LINE_BLANK) {
+		close_lists_to_depth(p, 0);
+	}
+}
+
+/*
+ * Calculate the content indent for a list item.
+ * Unordered: marker_indent + 2 (marker char + space)
+ * Ordered: marker_indent + digit_count + 2 (digits + delimiter + space)
+ */
+static int calc_content_indent(const struct classified_line *cl)
+{
+	if (cl->type == LINE_UNORDERED_LIST) {
+		return cl->indent + 2;
+	} else {
+		/* Count digits in ordered_number. */
+		int n = cl->ordered_number;
+		int digits = 0;
+		do {
+			digits++;
+			n /= 10;
+		} while (n > 0);
+		return cl->indent + digits + 2;
 	}
 }
 
@@ -2361,13 +2444,21 @@ static void open_list_if_needed(struct md4s_parser *p,
 				const struct classified_line *cl)
 {
 	bool ordered = (cl->type == LINE_ORDERED_LIST);
+	int content_indent = calc_content_indent(cl);
 
-	if (!p->in_list) {
+	if (p->list_depth == 0) {
+		/* No list open yet — start a new one. */
 		struct md4s_detail d = {0};
 		d.ordered = ordered;
+		d.is_tight = true;  /* Optimistic: assume tight. */
 		emit(p, MD4S_LIST_ENTER, &d);
-		p->in_list = true;
-		p->list_ordered = ordered;
+		p->list_depth = 1;
+		struct list_level *lvl = &p->list_stack[0];
+		lvl->ordered = ordered;
+		lvl->marker_indent = cl->indent;
+		lvl->content_indent = content_indent;
+		lvl->item_count = 0;
+		lvl->saw_blank = false;
 	}
 }
 
@@ -2455,6 +2546,72 @@ static void process_line(struct md4s_parser *p, const char *line,
 			 size_t raw_len)
 {
 	struct classified_line cl = classify_line(p, line, raw_len);
+
+	/* ---- Multi-line list item continuation detection ---- */
+	if (p->in_list_item && p->list_depth > 0) {
+		size_t len = strip_newline(line, raw_len);
+
+		if (cl.type == LINE_BLANK) {
+			/* Blank line within a list item: don't close yet.
+			 * Mark as pending — next line determines if the
+			 * item continues or ends. Also mark list as loose. */
+			p->list_item_blank_pending = true;
+			struct list_level *lvl =
+				&p->list_stack[p->list_depth - 1];
+			lvl->saw_blank = true;
+			p->needs_separator = true;
+			return;
+		}
+
+		/* Check if this line is a continuation of the current item. */
+		size_t ws_bytes = 0;
+		int eff_indent = count_indent(line, len, &ws_bytes);
+
+		/* A new list marker at the same indent as the current list
+		 * is a sibling item, not a continuation. A list marker at
+		 * greater indent could be a sub-list. */
+		bool is_list_line = (cl.type == LINE_UNORDERED_LIST ||
+				     cl.type == LINE_ORDERED_LIST);
+
+		if (is_list_line && cl.indent == p->list_item_marker_indent) {
+			/* Sibling item — fall through to normal processing. */
+		} else if (is_list_line &&
+			   cl.indent >= p->list_item_content_indent) {
+			/* Sub-list — fall through to normal processing.
+			 * The list case will handle nesting. */
+		} else if (!is_list_line &&
+			   eff_indent >= p->list_item_content_indent) {
+			/* Continuation line: content indented enough to
+			 * belong to the current item. */
+			if (p->list_item_blank_pending) {
+				/* Blank line before continuation makes
+				 * this a loose list. The item continues
+				 * but with paragraph separation. */
+				p->list_item_blank_pending = false;
+			}
+			/* Strip content indent and emit as continuation. */
+			const char *cont = line + ws_bytes;
+			size_t cont_len = len - ws_bytes;
+			/* Trim leading spaces beyond content_indent. */
+			while (cont_len > 0 && cont[0] == ' ') {
+				cont++;
+				cont_len--;
+			}
+			emit_simple(p, MD4S_SOFTBREAK);
+			parse_inline(p, cont, cont_len);
+			p->emitted_count++;
+			p->needs_separator = false;
+			return;
+		} else if (!is_list_line) {
+			/* Line with insufficient indent — ends the item.
+			 * Close lists back to where this line belongs. */
+			/* Fall through to normal processing, which will
+			 * call close_list_if_needed. */
+		}
+		/* If we had a pending blank and the next line is not
+		 * a continuation, the blank ended the item. */
+		p->list_item_blank_pending = false;
+	}
 
 	/* Paragraph interruption rules (CommonMark spec). */
 	if (in_open_paragraph(p)) {
@@ -2565,6 +2722,12 @@ static void process_line(struct md4s_parser *p, const char *line,
 			emit_simple(p, MD4S_NEWLINE);
 			break;
 		}
+		/* Track blank lines for loose/tight list detection. */
+		if (p->list_depth > 0) {
+			struct list_level *lvl =
+				&p->list_stack[p->list_depth - 1];
+			lvl->saw_blank = true;
+		}
 		p->needs_separator = true;
 		/* Close list on blank line followed by non-list. */
 		/* We set the flag; the actual close happens on next non-list line. */
@@ -2648,13 +2811,82 @@ static void process_line(struct md4s_parser *p, const char *line,
 		break;
 
 	case LINE_UNORDERED_LIST:
-	case LINE_ORDERED_LIST:
+	case LINE_ORDERED_LIST: {
+		bool ordered = (cl.type == LINE_ORDERED_LIST);
+		int content_indent = calc_content_indent(&cl);
+
+		/* Determine relationship to existing list stack. */
+		if (p->list_depth > 0) {
+			struct list_level *cur =
+				&p->list_stack[p->list_depth - 1];
+
+			if (cl.indent >= cur->content_indent &&
+			    p->list_depth < MAX_LIST_DEPTH) {
+				/* Sub-list: marker is within the content
+				 * region of the current item. Push a new
+				 * list level. Don't close the outer item. */
+				struct md4s_detail d = {0};
+				d.ordered = ordered;
+				d.is_tight = true;
+				emit(p, MD4S_LIST_ENTER, &d);
+				p->list_depth++;
+				struct list_level *nlvl =
+					&p->list_stack[p->list_depth - 1];
+				nlvl->ordered = ordered;
+				nlvl->marker_indent = cl.indent;
+				nlvl->content_indent = content_indent;
+				nlvl->item_count = 0;
+				nlvl->saw_blank = false;
+			} else if (cl.indent < cur->marker_indent) {
+				/* Dedent: pop levels until we find one
+				 * whose marker_indent matches or is less. */
+				while (p->list_depth > 1) {
+					struct list_level *top =
+						&p->list_stack[
+							p->list_depth - 1];
+					if (cl.indent >= top->marker_indent)
+						break;
+					close_list_item(p);
+					emit_simple(p, MD4S_LIST_LEAVE);
+					p->list_depth--;
+				}
+				cur = &p->list_stack[p->list_depth - 1];
+				/* Check for list type change. */
+				if (cur->ordered != ordered) {
+					close_list_item(p);
+					emit_simple(p, MD4S_LIST_LEAVE);
+					p->list_depth--;
+					/* Open new list. */
+					open_list_if_needed(p, &cl);
+				} else {
+					/* Sibling item in this list. */
+					close_list_item(p);
+				}
+			} else if (cur->ordered != ordered) {
+				/* Same indent but type change: close old
+				 * list, open new one. */
+				close_list_item(p);
+				emit_simple(p, MD4S_LIST_LEAVE);
+				p->list_depth--;
+				open_list_if_needed(p, &cl);
+			} else {
+				/* Sibling item at same indent. */
+				close_list_item(p);
+			}
+		}
+
 		maybe_emit_separator(p, &cl);
-		open_list_if_needed(p, &cl);
+		if (p->list_depth == 0)
+			open_list_if_needed(p, &cl);
+
+		struct list_level *lvl =
+			&p->list_stack[p->list_depth - 1];
+		lvl->item_count++;
+
 		{
 			struct md4s_detail d = {0};
 			d.item_number = cl.ordered_number;
-			d.list_depth = (cl.indent > 0) ? 1 : 0;
+			d.list_depth = p->list_depth - 1;
 			/* Task list detection: [x], [X], or [ ] prefix.
 			 * Only when TASKLISTS flag is enabled. */
 			const char *item_text = cl.content;
@@ -2679,12 +2911,18 @@ static void process_line(struct md4s_parser *p, const char *line,
 			emit(p, MD4S_LIST_ITEM_ENTER, &d);
 			parse_inline(p, item_text, item_len);
 		}
-		emit_simple(p, MD4S_LIST_ITEM_LEAVE);
-		emit_simple(p, MD4S_NEWLINE);
+		/* Don't emit LIST_ITEM_LEAVE yet — next line might
+		 * continue this item (multi-line list items). */
+		p->in_list_item = true;
+		p->list_stack[p->list_depth - 1].item_open = true;
+		p->list_item_content_indent = content_indent;
+		p->list_item_marker_indent = cl.indent;
+		p->list_item_blank_pending = false;
 		p->emitted_count++;
 		p->last_type = cl.type;
 		p->needs_separator = false;
 		break;
+	}
 
 	case LINE_TABLE_ROW:
 		/* Should not reach here — tables are handled in feed. */
@@ -3109,11 +3347,8 @@ char *md4s_finalize(struct md4s_parser *parser)
 	/* Close any open table. */
 	close_table_if_needed(parser);
 
-	/* Close any open list. */
-	if (parser->in_list) {
-		emit_simple(parser, MD4S_LIST_LEAVE);
-		parser->in_list = false;
-	}
+	/* Close any open list items and list levels. */
+	close_lists_to_depth(parser, 0);
 
 	/* Close any open code block. */
 	if (parser->state == STATE_FENCED_CODE) {

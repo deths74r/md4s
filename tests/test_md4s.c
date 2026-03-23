@@ -22,6 +22,7 @@ struct recorded_event {
 	char url[256];
 	char title[256];
 	bool ordered;
+	bool is_tight;
 	int item_number;
 	int list_depth;
 	bool is_task;
@@ -48,6 +49,7 @@ static void recorder_callback(enum md4s_event event,
 	if (detail) {
 		e->heading_level = detail->heading_level;
 		e->ordered = detail->ordered;
+		e->is_tight = detail->is_tight;
 		e->item_number = detail->item_number;
 		e->list_depth = detail->list_depth;
 		e->is_task = detail->is_task;
@@ -412,7 +414,7 @@ TEST(md4s_count_leading_all_match)
 /* Group 2: count_leading_spaces (tested via list indent)             */
 /* ================================================================== */
 
-/* Some leading spaces → indented list */
+/* Some leading spaces → indented list (still depth 0 without parent list) */
 TEST(md4s_leading_spaces_some)
 {
 	struct recorder_ctx ctx = {0};
@@ -420,7 +422,7 @@ TEST(md4s_leading_spaces_some)
 	const struct recorded_event *e =
 		find_event(&ctx, MD4S_LIST_ITEM_ENTER, 0);
 	ASSERT_NOT_NULL(e);
-	ASSERT_EQUAL_INT(1, e->list_depth);
+	ASSERT_EQUAL_INT(0, e->list_depth);
 	md4s_destroy(p);
 }
 
@@ -1137,7 +1139,7 @@ TEST(md4s_olist_multi_digit)
 	md4s_destroy(p);
 }
 
-/* Indented ordered list */
+/* Indented ordered list (depth 0 without parent list) */
 TEST(md4s_olist_indented)
 {
 	struct recorder_ctx ctx = {0};
@@ -1146,7 +1148,7 @@ TEST(md4s_olist_indented)
 	const struct recorded_event *e =
 		find_event(&ctx, MD4S_LIST_ITEM_ENTER, 0);
 	ASSERT_NOT_NULL(e);
-	ASSERT_EQUAL_INT(1, e->list_depth);
+	ASSERT_EQUAL_INT(0, e->list_depth);
 	md4s_destroy(p);
 }
 
@@ -4361,5 +4363,331 @@ TEST(md4s_gfm_autolink_multiple)
 		MD4S_LINK_ENTER, 1);
 	ASSERT_NOT_NULL(e2);
 	ASSERT_EQUAL_STRING("https://b.com", e2->url);
+	md4s_destroy(p);
+}
+
+/* ================================================================== */
+/* Loose vs Tight Lists                                               */
+/* ================================================================== */
+
+/* T1: No blank between items → tight */
+TEST(md4s_list_tight_no_blanks)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- a\n- b\n");
+	const struct recorded_event *e = find_event(&ctx,
+		MD4S_LIST_ENTER, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_TRUE(e->is_tight);
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LIST_ITEM_ENTER));
+	md4s_destroy(p);
+}
+
+/* T2: Blank between items → loose (saw_blank is true) */
+TEST(md4s_list_loose_blank_between)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- a\n\n- b\n");
+	/* List should have 2 items */
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LIST_ITEM_ENTER));
+	/* The list_enter is_tight should be true (optimistic),
+	 * but the list saw_blank means it's actually loose.
+	 * We check that both items exist. */
+	const struct recorded_event *e = find_event(&ctx,
+		MD4S_LIST_ENTER, 0);
+	ASSERT_NOT_NULL(e);
+	md4s_destroy(p);
+}
+
+/* T3: 3 items, no blanks → tight */
+TEST(md4s_list_tight_three_items)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- a\n- b\n- c\n");
+	const struct recorded_event *e = find_event(&ctx,
+		MD4S_LIST_ENTER, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_TRUE(e->is_tight);
+	ASSERT_EQUAL_INT(3, count_events(&ctx, MD4S_LIST_ITEM_ENTER));
+	md4s_destroy(p);
+}
+
+/* T7: Ordered tight list */
+TEST(md4s_olist_tight)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"1. a\n2. b\n");
+	const struct recorded_event *e = find_event(&ctx,
+		MD4S_LIST_ENTER, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_TRUE(e->is_tight);
+	ASSERT_TRUE(e->ordered);
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LIST_ITEM_ENTER));
+	md4s_destroy(p);
+}
+
+/* ================================================================== */
+/* Multi-Line List Items                                              */
+/* ================================================================== */
+
+/* M1: Continuation line included in item */
+TEST(md4s_list_multiline_basic)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- line1\n  line2\n");
+	/* Should be a single list item with SOFTBREAK between lines */
+	ASSERT_EQUAL_INT(1, count_events(&ctx, MD4S_LIST_ITEM_ENTER));
+	ASSERT_EQUAL_INT(1, count_events(&ctx, MD4S_LIST_ITEM_LEAVE));
+	ASSERT_TRUE(has_event(&ctx, MD4S_SOFTBREAK));
+	md4s_destroy(p);
+}
+
+/* M2: Line not indented enough is NOT a continuation */
+TEST(md4s_list_multiline_no_continuation)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- line1\nline2\n");
+	/* line2 is a paragraph, not part of the list item */
+	ASSERT_EQUAL_INT(1, count_events(&ctx, MD4S_LIST_ITEM_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_PARAGRAPH_ENTER));
+	md4s_destroy(p);
+}
+
+/* M3: Single item with 2 continuation lines */
+TEST(md4s_list_multiline_two_continuations)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- line1\n  line2\n  line3\n");
+	ASSERT_EQUAL_INT(1, count_events(&ctx, MD4S_LIST_ITEM_ENTER));
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_SOFTBREAK));
+	md4s_destroy(p);
+}
+
+/* M4: Ordered item continuation (indent >= 3) */
+TEST(md4s_list_multiline_ordered)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"1. line1\n   line2\n");
+	ASSERT_EQUAL_INT(1, count_events(&ctx, MD4S_LIST_ITEM_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_SOFTBREAK));
+	md4s_destroy(p);
+}
+
+/* M9: Two separate items (marker at same indent starts new item) */
+TEST(md4s_list_multiline_sibling_not_continuation)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- line1\n- line2\n");
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LIST_ITEM_ENTER));
+	md4s_destroy(p);
+}
+
+/* M10: Indented item with continuation */
+TEST(md4s_list_multiline_indented_item)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"  - line1\n    line2\n");
+	ASSERT_EQUAL_INT(1, count_events(&ctx, MD4S_LIST_ITEM_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_SOFTBREAK));
+	md4s_destroy(p);
+}
+
+/* ================================================================== */
+/* Proper List Nesting                                                */
+/* ================================================================== */
+
+/* N1: Single item at depth 0 */
+TEST(md4s_list_nest_single)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- a\n");
+	ASSERT_EQUAL_INT(1, count_events(&ctx, MD4S_LIST_ENTER));
+	ASSERT_EQUAL_INT(1, count_events(&ctx, MD4S_LIST_LEAVE));
+	const struct recorded_event *e = find_event(&ctx,
+		MD4S_LIST_ITEM_ENTER, 0);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_INT(0, e->list_depth);
+	md4s_destroy(p);
+}
+
+/* N2: Nested list: depth 0 then depth 1 */
+TEST(md4s_list_nest_two_levels)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- a\n  - b\n");
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LIST_ENTER));
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LIST_LEAVE));
+	const struct recorded_event *e0 = find_event(&ctx,
+		MD4S_LIST_ITEM_ENTER, 0);
+	ASSERT_NOT_NULL(e0);
+	ASSERT_EQUAL_INT(0, e0->list_depth);
+	const struct recorded_event *e1 = find_event(&ctx,
+		MD4S_LIST_ITEM_ENTER, 1);
+	ASSERT_NOT_NULL(e1);
+	ASSERT_EQUAL_INT(1, e1->list_depth);
+	md4s_destroy(p);
+}
+
+/* N3: 3 levels of nesting */
+TEST(md4s_list_nest_three_levels)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- a\n  - b\n    - c\n");
+	ASSERT_EQUAL_INT(3, count_events(&ctx, MD4S_LIST_ENTER));
+	ASSERT_EQUAL_INT(3, count_events(&ctx, MD4S_LIST_LEAVE));
+	const struct recorded_event *e2 = find_event(&ctx,
+		MD4S_LIST_ITEM_ENTER, 2);
+	ASSERT_NOT_NULL(e2);
+	ASSERT_EQUAL_INT(2, e2->list_depth);
+	md4s_destroy(p);
+}
+
+/* N4: Nested then back to depth 0 */
+TEST(md4s_list_nest_dedent)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- a\n  - b\n- c\n");
+	/* 2 LIST_ENTER (outer + inner), 2 LIST_LEAVE */
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LIST_ENTER));
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LIST_LEAVE));
+	/* 3 items total */
+	ASSERT_EQUAL_INT(3, count_events(&ctx, MD4S_LIST_ITEM_ENTER));
+	/* Third item should be depth 0 */
+	const struct recorded_event *e = find_event(&ctx,
+		MD4S_LIST_ITEM_ENTER, 2);
+	ASSERT_NOT_NULL(e);
+	ASSERT_EQUAL_INT(0, e->list_depth);
+	md4s_destroy(p);
+}
+
+/* N5: Mixed ordered/unordered nesting */
+TEST(md4s_list_nest_mixed)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- a\n  1. b\n");
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LIST_ENTER));
+	/* Outer list is unordered */
+	const struct recorded_event *le0 = find_event(&ctx,
+		MD4S_LIST_ENTER, 0);
+	ASSERT_NOT_NULL(le0);
+	ASSERT_FALSE(le0->ordered);
+	/* Inner list is ordered */
+	const struct recorded_event *le1 = find_event(&ctx,
+		MD4S_LIST_ENTER, 1);
+	ASSERT_NOT_NULL(le1);
+	ASSERT_TRUE(le1->ordered);
+	md4s_destroy(p);
+}
+
+/* N6: Two siblings at depth 1 */
+TEST(md4s_list_nest_siblings)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- a\n  - b\n  - c\n");
+	/* 2 LIST_ENTER: outer + inner. Inner has 2 items. */
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LIST_ENTER));
+	/* Items at depth 1 */
+	const struct recorded_event *e1 = find_event(&ctx,
+		MD4S_LIST_ITEM_ENTER, 1);
+	ASSERT_NOT_NULL(e1);
+	ASSERT_EQUAL_INT(1, e1->list_depth);
+	const struct recorded_event *e2 = find_event(&ctx,
+		MD4S_LIST_ITEM_ENTER, 2);
+	ASSERT_NOT_NULL(e2);
+	ASSERT_EQUAL_INT(1, e2->list_depth);
+	md4s_destroy(p);
+}
+
+/* N7: Full nesting sequence: 0, 1, 2, back to 1, back to 0 */
+TEST(md4s_list_nest_full_sequence)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- a\n  - b\n    - c\n  - d\n- e\n");
+	/* 3 LIST_ENTER (depth 0, 1, 2) */
+	ASSERT_EQUAL_INT(3, count_events(&ctx, MD4S_LIST_ENTER));
+	ASSERT_EQUAL_INT(3, count_events(&ctx, MD4S_LIST_LEAVE));
+	/* 5 items total */
+	ASSERT_EQUAL_INT(5, count_events(&ctx, MD4S_LIST_ITEM_ENTER));
+	/* Item 'd' at depth 1 */
+	const struct recorded_event *ed = find_event(&ctx,
+		MD4S_LIST_ITEM_ENTER, 3);
+	ASSERT_NOT_NULL(ed);
+	ASSERT_EQUAL_INT(1, ed->list_depth);
+	/* Item 'e' at depth 0 */
+	const struct recorded_event *ee = find_event(&ctx,
+		MD4S_LIST_ITEM_ENTER, 4);
+	ASSERT_NOT_NULL(ee);
+	ASSERT_EQUAL_INT(0, ee->list_depth);
+	md4s_destroy(p);
+}
+
+/* N8: Ordered at depth 0 with unordered sub-list */
+TEST(md4s_list_nest_ordered_with_unordered)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"1. a\n   - b\n");
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LIST_ENTER));
+	const struct recorded_event *le0 = find_event(&ctx,
+		MD4S_LIST_ENTER, 0);
+	ASSERT_NOT_NULL(le0);
+	ASSERT_TRUE(le0->ordered);
+	const struct recorded_event *le1 = find_event(&ctx,
+		MD4S_LIST_ENTER, 1);
+	ASSERT_NOT_NULL(le1);
+	ASSERT_FALSE(le1->ordered);
+	md4s_destroy(p);
+}
+
+/* N10: Sub-list under second item */
+TEST(md4s_list_nest_sublist_under_second)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- a\n- b\n  - c\n");
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LIST_ENTER));
+	ASSERT_EQUAL_INT(3, count_events(&ctx, MD4S_LIST_ITEM_ENTER));
+	/* Item c should be depth 1 */
+	const struct recorded_event *ec = find_event(&ctx,
+		MD4S_LIST_ITEM_ENTER, 2);
+	ASSERT_NOT_NULL(ec);
+	ASSERT_EQUAL_INT(1, ec->list_depth);
+	md4s_destroy(p);
+}
+
+/* Type change at same indent closes old, opens new */
+TEST(md4s_list_type_change)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"- a\n1. b\n");
+	/* Should have 2 LIST_ENTER and 2 LIST_LEAVE */
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LIST_ENTER));
+	ASSERT_EQUAL_INT(2, count_events(&ctx, MD4S_LIST_LEAVE));
+	const struct recorded_event *le0 = find_event(&ctx,
+		MD4S_LIST_ENTER, 0);
+	ASSERT_NOT_NULL(le0);
+	ASSERT_FALSE(le0->ordered);
+	const struct recorded_event *le1 = find_event(&ctx,
+		MD4S_LIST_ENTER, 1);
+	ASSERT_NOT_NULL(le1);
+	ASSERT_TRUE(le1->ordered);
 	md4s_destroy(p);
 }

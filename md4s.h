@@ -137,6 +137,9 @@ struct md4s_detail {
 	/* LIST_ENTER: true = ordered, false = unordered. */
 	bool ordered;
 
+	/* LIST_ENTER: true = tight list (no paragraph wrappers needed). */
+	bool is_tight;
+
 	/* LIST_ITEM_ENTER: 1-based item number for ordered lists. */
 	int item_number;
 
