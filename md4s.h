@@ -95,6 +95,20 @@ enum md4s_event {
 };
 
 /* ------------------------------------------------------------------ */
+/* Configuration flags                                                */
+/* ------------------------------------------------------------------ */
+
+#define MD4S_FLAG_TABLES          0x0001  /* GFM tables (default: on) */
+#define MD4S_FLAG_STRIKETHROUGH   0x0002  /* ~~strikethrough~~ (default: on) */
+#define MD4S_FLAG_TASKLISTS       0x0004  /* [x] task lists (default: on) */
+#define MD4S_FLAG_NOHTMLBLOCKS    0x0008  /* Disable HTML blocks */
+#define MD4S_FLAG_NOHTMLSPANS     0x0010  /* Disable inline HTML (<tag>) */
+#define MD4S_FLAG_NOINDENTEDCODE  0x0020  /* Disable indented code blocks */
+
+#define MD4S_FLAG_DEFAULT  (MD4S_FLAG_TABLES | MD4S_FLAG_STRIKETHROUGH | \
+                            MD4S_FLAG_TASKLISTS)
+
+/* ------------------------------------------------------------------ */
 /* Event detail                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -178,6 +192,18 @@ struct md4s_parser;
  * Returns the parser handle, or NULL on allocation failure.
  */
 struct md4s_parser *md4s_create(md4s_callback callback, void *user_data);
+
+/*
+ * Creates a streaming markdown parser with configuration flags.
+ *
+ * callback  — Event handler. Must not be NULL.
+ * user_data — Opaque pointer forwarded to every callback.
+ * flags     — Bitwise OR of MD4S_FLAG_* constants.
+ *
+ * Returns the parser handle, or NULL on allocation failure.
+ */
+struct md4s_parser *md4s_create_ex(md4s_callback callback, void *user_data,
+                                   unsigned int flags);
 
 /*
  * Feeds raw markdown bytes to the parser. May be called any number

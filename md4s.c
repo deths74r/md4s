@@ -124,6 +124,12 @@ struct md4s_parser {
 	int table_alignments[TABLE_MAX_COLUMNS]; /* 0=none,1=left,2=center,3=right */
 	bool table_head_done;
 
+	/* HTML block type tracking (1-7). */
+	int html_block_type;
+
+	/* Configuration flags. */
+	unsigned int flags;
+
 	/* Deferred line for table lookahead. */
 	char *deferred_line;
 	size_t deferred_len;
@@ -212,6 +218,27 @@ static size_t count_leading_spaces(const char *s, size_t len)
 	while (n < len && s[n] == ' ')
 		n++;
 	return n;
+}
+
+/*
+ * Count effective indentation, expanding tabs to 4-column tab stops.
+ * Returns the effective indent. Sets *bytes_consumed to the number
+ * of raw whitespace bytes consumed (can be NULL).
+ */
+static int count_indent(const char *s, size_t len, size_t *bytes_consumed)
+{
+	int indent = 0;
+	size_t i = 0;
+	while (i < len && (s[i] == ' ' || s[i] == '\t')) {
+		if (s[i] == '\t')
+			indent = (indent + 4) & ~3; /* next tab stop */
+		else
+			indent++;
+		i++;
+	}
+	if (bytes_consumed)
+		*bytes_consumed = i;
+	return indent;
 }
 
 static bool is_all_whitespace(const char *s, size_t len)
@@ -411,19 +438,55 @@ static int is_setext_underline(const char *line, size_t len)
 }
 
 /*
- * Check if a line starts an HTML block. Returns true if the line
- * begins with a block-level HTML tag or HTML comment.
+ * Case-insensitive tag name match helper.
+ * Returns true if tag at line[tag_start..tag_start+tag_len) matches name.
  */
-static bool is_html_block_start(const char *line, size_t len)
+static bool tag_name_eq(const char *line, size_t tag_start, size_t tag_len,
+			const char *name)
+{
+	size_t nlen = strlen(name);
+	if (nlen != tag_len)
+		return false;
+	for (size_t j = 0; j < tag_len; j++) {
+		char a = line[tag_start + j];
+		if (a >= 'A' && a <= 'Z')
+			a += 32;
+		if (a != name[j])
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Detect HTML block type per CommonMark spec 4.6.
+ * Returns 0 if not an HTML block, 1-7 for the type.
+ *
+ * in_paragraph: true if currently in an open paragraph (type 7 cannot
+ * interrupt a paragraph).
+ */
+static int detect_html_block_type(const char *line, size_t len,
+				  bool in_paragraph)
 {
 	if (len < 2 || line[0] != '<')
-		return false;
+		return 0;
 
-	/* HTML comment: <!-- */
+	/* Type 2: HTML comment <!-- */
 	if (len >= 4 && line[1] == '!' && line[2] == '-' && line[3] == '-')
-		return true;
+		return 2;
 
-	/* Skip optional '/' for closing tags. */
+	/* Type 5: <![CDATA[ */
+	if (len >= 9 && memcmp(line, "<![CDATA[", 9) == 0)
+		return 5;
+
+	/* Type 4: <! followed by uppercase letter */
+	if (len >= 3 && line[1] == '!' && line[2] >= 'A' && line[2] <= 'Z')
+		return 4;
+
+	/* Type 3: <? processing instruction */
+	if (line[1] == '?')
+		return 3;
+
+	/* Extract tag name for types 1, 6, 7. */
 	size_t pos = 1;
 	bool closing = false;
 	if (pos < len && line[pos] == '/') {
@@ -431,7 +494,6 @@ static bool is_html_block_start(const char *line, size_t len)
 		pos++;
 	}
 
-	/* Extract tag name. */
 	size_t tag_start = pos;
 	while (pos < len && ((line[pos] >= 'a' && line[pos] <= 'z') ||
 			     (line[pos] >= 'A' && line[pos] <= 'Z') ||
@@ -440,14 +502,23 @@ static bool is_html_block_start(const char *line, size_t len)
 		pos++;
 	size_t tag_len = pos - tag_start;
 	if (tag_len == 0)
-		return false;
+		return 0;
 
-	/* Must be followed by space, >, />, or end. */
+	/* Must be followed by space, tab, >, />, newline, or end. */
 	if (pos < len && line[pos] != ' ' && line[pos] != '>' &&
-	    line[pos] != '/' && line[pos] != '\t')
-		return false;
+	    line[pos] != '/' && line[pos] != '\t' && line[pos] != '\n')
+		return 0;
 
-	/* Check against block-level tags. */
+	/* Type 1: script, pre, style, textarea */
+	static const char *type1_tags[] = {
+		"script", "pre", "style", "textarea", NULL
+	};
+	for (int i = 0; type1_tags[i] != NULL; i++) {
+		if (tag_name_eq(line, tag_start, tag_len, type1_tags[i]))
+			return 1;
+	}
+
+	/* Type 6: block-level tags */
 	static const char *block_tags[] = {
 		"address", "article", "aside", "base", "basefont",
 		"blockquote", "body", "caption", "center", "col",
@@ -457,27 +528,147 @@ static bool is_html_block_start(const char *line, size_t len)
 		"h3", "h4", "h5", "h6", "head", "header", "hr",
 		"html", "iframe", "legend", "li", "link", "main",
 		"menu", "menuitem", "nav", "noframes", "ol",
-		"optgroup", "option", "p", "param", "pre", "script",
-		"section", "source", "style", "summary", "table",
+		"optgroup", "option", "p", "param",
+		"section", "source", "summary", "table",
 		"tbody", "td", "template", "tfoot", "th", "thead",
 		"title", "tr", "track", "ul", NULL
 	};
 
 	for (int i = 0; block_tags[i] != NULL; i++) {
-		size_t bt_len = strlen(block_tags[i]);
-		if (bt_len == tag_len) {
+		if (tag_name_eq(line, tag_start, tag_len, block_tags[i]))
+			return 6;
+	}
+
+	/* Type 7: any complete open/close tag alone on a line.
+	 * Cannot interrupt a paragraph. Tag must not be type 1 or 6
+	 * (already checked above). */
+	if (in_paragraph)
+		return 0;
+
+	if (closing) {
+		/* Close tag: </ tagname optional-whitespace > */
+		while (pos < len && (line[pos] == ' ' || line[pos] == '\t'))
+			pos++;
+		if (pos < len && line[pos] == '>') {
+			pos++;
+			/* Rest must be whitespace. */
+			while (pos < len && (line[pos] == ' ' ||
+					     line[pos] == '\t'))
+				pos++;
+			if (pos >= len)
+				return 7;
+		}
+		return 0;
+	}
+
+	/* Open tag: < tagname attributes* optional-/ > */
+	/* Skip attributes. */
+	for (;;) {
+		/* Skip whitespace. */
+		bool had_ws = false;
+		while (pos < len && (line[pos] == ' ' || line[pos] == '\t')) {
+			pos++;
+			had_ws = true;
+		}
+		if (pos >= len)
+			return 0;
+		/* Check for end of tag. */
+		if (line[pos] == '>') {
+			pos++;
+			break;
+		}
+		if (line[pos] == '/' && pos + 1 < len &&
+		    line[pos + 1] == '>') {
+			pos += 2;
+			break;
+		}
+		/* Attribute name must follow whitespace. */
+		if (!had_ws)
+			return 0;
+		/* Attribute name: [a-zA-Z_:][a-zA-Z0-9_.:-]* */
+		if (!((line[pos] >= 'a' && line[pos] <= 'z') ||
+		      (line[pos] >= 'A' && line[pos] <= 'Z') ||
+		      line[pos] == '_' || line[pos] == ':'))
+			return 0;
+		pos++;
+		while (pos < len && ((line[pos] >= 'a' && line[pos] <= 'z') ||
+				     (line[pos] >= 'A' && line[pos] <= 'Z') ||
+				     (line[pos] >= '0' && line[pos] <= '9') ||
+				     line[pos] == '_' || line[pos] == '.' ||
+				     line[pos] == ':' || line[pos] == '-'))
+			pos++;
+		/* Optional attribute value. */
+		/* Skip whitespace. */
+		while (pos < len && (line[pos] == ' ' || line[pos] == '\t'))
+			pos++;
+		if (pos < len && line[pos] == '=') {
+			pos++;
+			while (pos < len && (line[pos] == ' ' ||
+					     line[pos] == '\t'))
+				pos++;
+			if (pos >= len)
+				return 0;
+			if (line[pos] == '"') {
+				pos++;
+				while (pos < len && line[pos] != '"')
+					pos++;
+				if (pos >= len)
+					return 0;
+				pos++; /* skip closing " */
+			} else if (line[pos] == '\'') {
+				pos++;
+				while (pos < len && line[pos] != '\'')
+					pos++;
+				if (pos >= len)
+					return 0;
+				pos++; /* skip closing ' */
+			} else {
+				/* Unquoted value. */
+				while (pos < len && line[pos] != ' ' &&
+				       line[pos] != '\t' &&
+				       line[pos] != '"' &&
+				       line[pos] != '\'' &&
+				       line[pos] != '=' &&
+				       line[pos] != '<' &&
+				       line[pos] != '>' &&
+				       line[pos] != '`')
+					pos++;
+			}
+		}
+	}
+	/* Rest of line must be whitespace. */
+	while (pos < len && (line[pos] == ' ' || line[pos] == '\t'))
+		pos++;
+	if (pos >= len)
+		return 7;
+	return 0;
+}
+
+/*
+ * Case-insensitive substring search for a closing tag like </script>.
+ * Returns true if found anywhere in line.
+ */
+static bool contains_closing_tag(const char *line, size_t len,
+				 const char *tag)
+{
+	size_t tlen = strlen(tag);
+	/* We search for "</" + tag + ">" case-insensitively. */
+	size_t need = 2 + tlen + 1; /* </ + tag + > */
+	if (len < need)
+		return false;
+	for (size_t i = 0; i + need <= len; i++) {
+		if (line[i] == '<' && line[i + 1] == '/') {
 			bool match = true;
-			for (size_t j = 0; j < tag_len; j++) {
-				char a = line[tag_start + j];
-				char b = block_tags[i][j];
+			for (size_t j = 0; j < tlen; j++) {
+				char a = line[i + 2 + j];
 				if (a >= 'A' && a <= 'Z')
 					a += 32;
-				if (a != b) {
+				if (a != tag[j]) {
 					match = false;
 					break;
 				}
 			}
-			if (match)
+			if (match && line[i + 2 + tlen] == '>')
 				return true;
 		}
 	}
@@ -485,20 +676,64 @@ static bool is_html_block_start(const char *line, size_t len)
 }
 
 /*
- * Check if a line ends an HTML block. Returns true if it contains
- * a closing tag or comment end for block-level HTML, or is blank.
+ * Check if a line ends an HTML block of the given type.
+ * Per CommonMark spec 4.6:
+ *   Type 1: closing tag </script>, </pre>, </style>, </textarea>
+ *   Type 2: -->
+ *   Type 3: ?>
+ *   Type 4: >
+ *   Type 5: ]]>
+ *   Type 6: blank line
+ *   Type 7: blank line
  */
-static bool is_html_block_end(const char *line, size_t len)
+static bool is_html_block_end(const char *line, size_t len,
+			      int html_block_type)
 {
-	if (len == 0)
-		return true; /* blank line ends HTML block */
-	/* Check for --> (comment end). */
-	for (size_t i = 0; i + 2 < len; i++) {
-		if (line[i] == '-' && line[i + 1] == '-' &&
-		    line[i + 2] == '>')
-			return true;
+	switch (html_block_type) {
+	case 1: {
+		static const char *type1_closers[] = {
+			"script", "pre", "style", "textarea", NULL
+		};
+		for (int i = 0; type1_closers[i] != NULL; i++) {
+			if (contains_closing_tag(line, len, type1_closers[i]))
+				return true;
+		}
+		return false;
 	}
-	return false;
+	case 2:
+		for (size_t i = 0; i + 2 < len; i++) {
+			if (line[i] == '-' && line[i + 1] == '-' &&
+			    line[i + 2] == '>')
+				return true;
+		}
+		return false;
+	case 3:
+		for (size_t i = 0; i + 1 < len; i++) {
+			if (line[i] == '?' && line[i + 1] == '>')
+				return true;
+		}
+		return false;
+	case 4:
+		for (size_t i = 0; i < len; i++) {
+			if (line[i] == '>')
+				return true;
+		}
+		return false;
+	case 5:
+		for (size_t i = 0; i + 2 < len; i++) {
+			if (line[i] == ']' && line[i + 1] == ']' &&
+			    line[i + 2] == '>')
+				return true;
+		}
+		return false;
+	case 6:
+	case 7:
+		if (len == 0)
+			return true;
+		return false;
+	default:
+		return len == 0;
+	}
 }
 
 /* Forward declaration: parse_inline is used by emit_table_row. */
@@ -728,6 +963,8 @@ struct classified_line {
 	int fence_length;       /* For fence open. */
 	const char *info_string; /* For fence open (language). */
 	size_t info_length;
+	int html_type;          /* HTML block type detected (1-7). */
+	bool html_block_ends_here; /* This line closes the HTML block. */
 };
 
 /* Forward declarations for functions used before their definitions. */
@@ -735,6 +972,17 @@ static void close_paragraph(struct md4s_parser *p);
 static void close_list_if_needed(struct md4s_parser *p, enum line_type type);
 static void maybe_emit_separator(struct md4s_parser *p,
 				 const struct classified_line *cl);
+
+/*
+ * Returns true if a paragraph is currently open (for paragraph
+ * interruption rule checks).
+ */
+static bool in_open_paragraph(const struct md4s_parser *p)
+{
+	return p->last_type == LINE_PARAGRAPH &&
+	       p->emitted_count > 0 &&
+	       !p->needs_separator;
+}
 
 /*
  * Strips trailing \n and \r from a line, returning the trimmed length.
@@ -776,10 +1024,21 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 		return cl;
 	}
 
-	/* Inside an HTML block — pass through until blank line. */
+	/* Inside an HTML block — per-type end detection. */
 	if (p->state == STATE_HTML_BLOCK) {
-		if (len == 0 || is_all_whitespace(line, len)) {
-			cl.type = LINE_BLANK;
+		/* Types 6,7 end on blank line. */
+		if (p->html_block_type >= 6) {
+			if (len == 0 || is_all_whitespace(line, len)) {
+				cl.type = LINE_BLANK;
+				return cl;
+			}
+		}
+		/* Types 1-5 check for end marker in this line. */
+		if (is_html_block_end(line, len, p->html_block_type)) {
+			cl.type = LINE_HTML_BLOCK;
+			cl.content = line;
+			cl.content_length = len;
+			cl.html_block_ends_here = true;
 			return cl;
 		}
 		cl.type = LINE_HTML_BLOCK;
@@ -878,39 +1137,59 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 		return cl;
 	}
 
-	/* Indented code block: 4+ spaces (not inside list). */
-	if (!p->in_list && len >= 4 &&
-	    line[0] == ' ' && line[1] == ' ' &&
-	    line[2] == ' ' && line[3] == ' ') {
-		cl.type = LINE_INDENTED_CODE;
-		cl.content = line + 4;
-		cl.content_length = len - 4;
-		return cl;
+	/* Indented code block: 4+ effective indent (tabs expand).
+	 * Not inside list. Disabled by NOINDENTEDCODE flag. */
+	if (!p->in_list && !(p->flags & MD4S_FLAG_NOINDENTEDCODE)) {
+		size_t ws_bytes = 0;
+		int eff_indent = count_indent(line, len, &ws_bytes);
+		if (eff_indent >= 4 && ws_bytes > 0) {
+			cl.type = LINE_INDENTED_CODE;
+			/* Strip exactly 4 columns of indent. For simple
+			 * spaces, skip 4 bytes. For tabs, skip the bytes
+			 * consumed by count_indent but content starts at
+			 * the point where 4 columns are consumed. */
+			if (line[0] == '\t') {
+				/* A leading tab provides 4 columns. */
+				cl.content = line + 1;
+				cl.content_length = len - 1;
+			} else {
+				/* Leading spaces: skip 4 bytes. */
+				cl.content = line + 4;
+				cl.content_length = len - 4;
+			}
+			return cl;
+		}
 	}
 
-	/* HTML block: starts with block-level HTML tag. */
-	if (is_html_block_start(line, len)) {
-		cl.type = LINE_HTML_BLOCK;
-		cl.content = line;
-		cl.content_length = len;
-		return cl;
+	/* HTML block: detect type. Disabled by NOHTMLBLOCKS flag. */
+	if (!(p->flags & MD4S_FLAG_NOHTMLBLOCKS)) {
+		int html_type = detect_html_block_type(
+			line, len, in_open_paragraph(p));
+		if (html_type > 0) {
+			cl.type = LINE_HTML_BLOCK;
+			cl.html_type = html_type;
+			cl.content = line;
+			cl.content_length = len;
+			return cl;
+		}
 	}
 
 	/* Unordered list: optional indent, then [-*+] space. */
 	{
-		size_t indent = count_leading_spaces(line, len);
-		if (indent < len - 1) {
-			char marker = line[indent];
+		size_t ws_bytes = 0;
+		int eff_indent = count_indent(line, len, &ws_bytes);
+		if (ws_bytes < len - 1) {
+			char marker = line[ws_bytes];
 			if ((marker == '-' || marker == '*' ||
 			     marker == '+') &&
-			    indent + 1 < len && line[indent + 1] == ' ') {
+			    ws_bytes + 1 < len && line[ws_bytes + 1] == ' ') {
 				/* Make sure '-' isn't a thematic break. */
 				if (marker != '-' || !is_thematic_break(line, len)) {
 					cl.type = LINE_UNORDERED_LIST;
-					cl.indent = (int)indent;
-					cl.content = line + indent + 2;
+					cl.indent = eff_indent;
+					cl.content = line + ws_bytes + 2;
 					cl.content_length =
-						len - indent - 2;
+						len - ws_bytes - 2;
 					while (cl.content_length > 0 &&
 					       cl.content[0] == ' ') {
 						cl.content++;
@@ -924,19 +1203,20 @@ static struct classified_line classify_line(const struct md4s_parser *p,
 
 	/* Ordered list: optional indent, 1-9 digits, [.)] space. */
 	{
-		size_t indent = count_leading_spaces(line, len);
-		size_t i = indent;
-		while (i < len && i < indent + MAX_OLIST_DIGITS &&
+		size_t ws_bytes = 0;
+		int eff_indent = count_indent(line, len, &ws_bytes);
+		size_t i = ws_bytes;
+		while (i < len && i < ws_bytes + MAX_OLIST_DIGITS &&
 		       line[i] >= '0' && line[i] <= '9')
 			i++;
-		if (i > indent && i < len &&
+		if (i > ws_bytes && i < len &&
 		    (line[i] == '.' || line[i] == ')') &&
 		    i + 1 < len && line[i + 1] == ' ') {
 			cl.type = LINE_ORDERED_LIST;
-			cl.indent = (int)indent;
+			cl.indent = eff_indent;
 			/* Parse the number. */
 			cl.ordered_number = 0;
-			for (size_t j = indent; j < i; j++)
+			for (size_t j = ws_bytes; j < i; j++)
 				cl.ordered_number =
 					cl.ordered_number * 10 +
 					(line[j] - '0');
@@ -1363,8 +1643,9 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 			continue;
 		}
 
-		/* Inline HTML. */
-		if (text[pos] == '<' && pos + 1 < length) {
+		/* Inline HTML (skipped when NOHTMLSPANS is set). */
+		if (!(p->flags & MD4S_FLAG_NOHTMLSPANS) &&
+		    text[pos] == '<' && pos + 1 < length) {
 			size_t hstart = pos + 1;
 			size_t hend = 0;
 			bool is_html = false;
@@ -1472,8 +1753,10 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 			}
 		}
 
-		/* Autolink: <url> or <email>. */
-		if (text[pos] == '<') {
+		/* Autolink: <url> or <email>.
+		 * Also skipped when NOHTMLSPANS is set. */
+		if (!(p->flags & MD4S_FLAG_NOHTMLSPANS) &&
+		    text[pos] == '<') {
 			size_t close = pos + 1;
 			while (close < length && text[close] != '>' &&
 			       text[close] != ' ' && text[close] != '\n')
@@ -1694,8 +1977,10 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 				pos++;
 			size_t run_len = pos - run_start;
 
-			/* Tilde: only runs of exactly 2 are valid. */
-			if (ch == '~' && run_len != 2) {
+			/* Tilde: only runs of exactly 2 are valid,
+			 * and only when strikethrough is enabled. */
+			if (ch == '~' && (run_len != 2 ||
+			    !(p->flags & MD4S_FLAG_STRIKETHROUGH))) {
 				/* Treat as literal text — no mark. */
 				continue;
 			}
@@ -2092,6 +2377,35 @@ static void process_line(struct md4s_parser *p, const char *line,
 {
 	struct classified_line cl = classify_line(p, line, raw_len);
 
+	/* Paragraph interruption rules (CommonMark spec). */
+	if (in_open_paragraph(p)) {
+		/* Rule 1: Ordered list with start != 1 cannot interrupt. */
+		if (cl.type == LINE_ORDERED_LIST && cl.ordered_number != 1) {
+			cl.type = LINE_PARAGRAPH;
+			cl.content = line;
+			cl.content_length = strip_newline(line, raw_len);
+			while (cl.content_length > 0 && cl.content[0] == ' ') {
+				cl.content++;
+				cl.content_length--;
+			}
+		}
+		/* Rule 2: Empty list item cannot interrupt. */
+		if ((cl.type == LINE_UNORDERED_LIST ||
+		     cl.type == LINE_ORDERED_LIST) &&
+		    cl.content_length == 0) {
+			cl.type = LINE_PARAGRAPH;
+			cl.content = line;
+			cl.content_length = strip_newline(line, raw_len);
+			while (cl.content_length > 0 && cl.content[0] == ' ') {
+				cl.content++;
+				cl.content_length--;
+			}
+		}
+		/* Rule 3: HTML block type 7 cannot interrupt a paragraph.
+		 * (Already handled by detect_html_block_type's
+		 * in_paragraph parameter.) */
+	}
+
 	/* Reference link definition: [label]: url
 	 * Consumed silently — not emitted as events. */
 	if (cl.type == LINE_PARAGRAPH) {
@@ -2156,8 +2470,10 @@ static void process_line(struct md4s_parser *p, const char *line,
 
 	switch (cl.type) {
 	case LINE_BLANK:
-		/* Close HTML block on blank line. */
-		if (p->state == STATE_HTML_BLOCK) {
+		/* Close HTML block on blank line (types 6,7 only).
+		 * Types 1-5 are NOT closed by blank lines. */
+		if (p->state == STATE_HTML_BLOCK &&
+		    p->html_block_type >= 6) {
 			emit_simple(p, MD4S_HTML_BLOCK_LEAVE);
 			emit_simple(p, MD4S_NEWLINE);
 			p->state = STATE_NORMAL;
@@ -2260,10 +2576,12 @@ static void process_line(struct md4s_parser *p, const char *line,
 			struct md4s_detail d = {0};
 			d.item_number = cl.ordered_number;
 			d.list_depth = (cl.indent > 0) ? 1 : 0;
-			/* Task list detection: [x], [X], or [ ] prefix. */
+			/* Task list detection: [x], [X], or [ ] prefix.
+			 * Only when TASKLISTS flag is enabled. */
 			const char *item_text = cl.content;
 			size_t item_len = cl.content_length;
-			if (item_len >= 3 && item_text[0] == '[' &&
+			if ((p->flags & MD4S_FLAG_TASKLISTS) &&
+			    item_len >= 3 && item_text[0] == '[' &&
 			    (item_text[1] == 'x' || item_text[1] == 'X' ||
 			     item_text[1] == ' ') &&
 			    item_text[2] == ']' &&
@@ -2312,10 +2630,18 @@ static void process_line(struct md4s_parser *p, const char *line,
 
 	case LINE_HTML_BLOCK:
 		if (p->state == STATE_HTML_BLOCK) {
-			/* Continuation line — just emit text. */
+			/* Continuation line — emit text. */
 			emit_text(p, MD4S_TEXT, cl.content,
 				  cl.content_length);
 			emit_simple(p, MD4S_NEWLINE);
+			/* Check if this line ends the HTML block
+			 * (types 1-5 have mid-line end markers). */
+			if (cl.html_block_ends_here) {
+				emit_simple(p, MD4S_HTML_BLOCK_LEAVE);
+				emit_simple(p, MD4S_NEWLINE);
+				p->state = STATE_NORMAL;
+				p->needs_separator = true;
+			}
 		} else {
 			/* Opening line. */
 			close_table_if_needed(p);
@@ -2325,10 +2651,23 @@ static void process_line(struct md4s_parser *p, const char *line,
 			emit_text(p, MD4S_TEXT, cl.content,
 				  cl.content_length);
 			emit_simple(p, MD4S_NEWLINE);
-			p->state = STATE_HTML_BLOCK;
+			p->html_block_type = cl.html_type;
+			/* Check if the opening line also contains the
+			 * end marker (single-line HTML blocks). */
+			if (is_html_block_end(cl.content, cl.content_length,
+					      cl.html_type)) {
+				/* Close immediately. */
+				emit_simple(p, MD4S_HTML_BLOCK_LEAVE);
+				emit_simple(p, MD4S_NEWLINE);
+				p->state = STATE_NORMAL;
+				p->needs_separator = true;
+			} else {
+				p->state = STATE_HTML_BLOCK;
+			}
 			p->emitted_count++;
 			p->last_type = LINE_HTML_BLOCK;
-			p->needs_separator = false;
+			if (p->state == STATE_HTML_BLOCK)
+				p->needs_separator = false;
 		}
 		break;
 
@@ -2548,8 +2887,9 @@ void md4s_feed(struct md4s_parser *parser, const char *data, size_t length)
 			}
 
 			/* Defer pipe-containing paragraph lines for
-			 * table detection. */
-			if (cl.type == LINE_PARAGRAPH &&
+			 * table detection (only when tables enabled). */
+			if ((parser->flags & MD4S_FLAG_TABLES) &&
+			    cl.type == LINE_PARAGRAPH &&
 			    parser->state == STATE_NORMAL &&
 			    !parser->in_table) {
 				bool has_pipe = false;
@@ -2597,6 +2937,12 @@ void md4s_feed(struct md4s_parser *parser, const char *data, size_t length)
 
 struct md4s_parser *md4s_create(md4s_callback callback, void *user_data)
 {
+	return md4s_create_ex(callback, user_data, MD4S_FLAG_DEFAULT);
+}
+
+struct md4s_parser *md4s_create_ex(md4s_callback callback, void *user_data,
+				   unsigned int flags)
+{
 	if (callback == NULL)
 		return NULL;
 
@@ -2607,6 +2953,7 @@ struct md4s_parser *md4s_create(md4s_callback callback, void *user_data)
 	p->callback = callback;
 	p->user_data = user_data;
 	p->state = STATE_NORMAL;
+	p->flags = flags;
 
 	p->line_buf = malloc(LINE_BUFFER_INITIAL);
 	p->line_cap = LINE_BUFFER_INITIAL;

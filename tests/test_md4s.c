@@ -3675,3 +3675,576 @@ TEST(md4s_seq_complex)
 	ASSERT_TRUE(count_events(&ctx, MD4S_BLOCK_SEPARATOR) >= 3);
 	md4s_destroy(p);
 }
+
+/* Feed markdown with flags, finalize, return parser (caller must destroy). */
+static struct md4s_parser *feed_and_finalize_ex(struct recorder_ctx *ctx,
+						const char *md,
+						unsigned int flags)
+{
+	ctx->count = 0;
+	struct md4s_parser *p = md4s_create_ex(recorder_callback, ctx, flags);
+	if (md && *md)
+		md4s_feed(p, md, strlen(md));
+	char *raw = md4s_finalize(p);
+	free(raw);
+	return p;
+}
+
+/* ================================================================== */
+/* HTML Block Types 1, 3, 4, 5, 7                                     */
+/* ================================================================== */
+
+/* Type 1: <script> multi-line, ends at </script> */
+TEST(md4s_html_type1_script_multiline)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<script>\nalert(1)\n</script>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	/* Should have 3 TEXT events (one per line). */
+	ASSERT_TRUE(count_events(&ctx, MD4S_TEXT) >= 3);
+	md4s_destroy(p);
+}
+
+/* Type 1: single-line (mid-line end) */
+TEST(md4s_html_type1_script_singleline)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<script>alert(1)</script>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 1: case insensitive start */
+TEST(md4s_html_type1_case_insensitive)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<SCRIPT>\nfoo\n</script>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 1: <pre> */
+TEST(md4s_html_type1_pre)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<pre>\ncode\n</pre>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 1: <style> */
+TEST(md4s_html_type1_style)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<style>\n.a{}\n</style>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 1: <textarea> */
+TEST(md4s_html_type1_textarea)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<textarea>\ntext\n</textarea>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 1: blank line does NOT end the block */
+TEST(md4s_html_type1_blank_no_close)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<script>\nfoo\n\nbar\n</script>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	/* No paragraph — all within the HTML block. */
+	ASSERT_TRUE(!has_event(&ctx, MD4S_PARAGRAPH_ENTER));
+	md4s_destroy(p);
+}
+
+/* Type 1: finalize closes unclosed block */
+TEST(md4s_html_type1_unclosed_finalize)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<script>\nno close\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 3: <? processing instruction, ends at ?> */
+TEST(md4s_html_type3_single_line)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<?xml version=\"1.0\"?>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 3: multi-line */
+TEST(md4s_html_type3_multiline)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<?php\necho \"hi\";\n?>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 4: <! + uppercase (declaration), ends at > */
+TEST(md4s_html_type4_doctype)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<!DOCTYPE html>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 4: multi-line */
+TEST(md4s_html_type4_multiline)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<!DOCTYPE\nhtml>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 4: lowercase NOT type 4 */
+TEST(md4s_html_type4_lowercase_not_type4)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<!doctype html>\n");
+	/* <!doctype has lowercase after <!, so NOT type 4.
+	 * This won't match type 4, but the '!' + 'd' (lowercase)
+	 * won't match. It could fall through to paragraph. */
+	ASSERT_TRUE(!has_event(&ctx, MD4S_HTML_BLOCK_ENTER) ||
+		    has_event(&ctx, MD4S_PARAGRAPH_ENTER));
+	md4s_destroy(p);
+}
+
+/* Type 5: <![CDATA[ ... ]]> */
+TEST(md4s_html_type5_cdata_multiline)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<![CDATA[\ndata\n]]>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 5: single line */
+TEST(md4s_html_type5_cdata_singleline)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<![CDATA[data]]>\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 7: custom tag, ends at blank line */
+TEST(md4s_html_type7_custom_tag)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<custom>\nfoo\n\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 7: self-closing tag */
+TEST(md4s_html_type7_self_closing)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<custom />\nfoo\n\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 7: close tag starts HTML block */
+TEST(md4s_html_type7_close_tag)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"</custom>\nfoo\n\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 7: cannot interrupt a paragraph */
+TEST(md4s_html_type7_no_interrupt_paragraph)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"para\n<custom>\n\n");
+	/* Should be a paragraph, not an HTML block. */
+	ASSERT_TRUE(has_event(&ctx, MD4S_PARAGRAPH_ENTER));
+	/* The <custom> should be part of the paragraph as inline. */
+	md4s_destroy(p);
+}
+
+/* Type 7: open tag with attributes */
+TEST(md4s_html_type7_attributes)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<custom attr=\"val\">\n\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* Type 6 tags (div etc.) are NOT type 7 */
+TEST(md4s_html_type7_not_for_div)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"<div>\nfoo\n\n");
+	/* Should be type 6 HTML block (which ends on blank line). */
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_LEAVE));
+	md4s_destroy(p);
+}
+
+/* ================================================================== */
+/* Tab Expansion                                                       */
+/* ================================================================== */
+
+/* Tab at start = 4 spaces = indented code */
+TEST(md4s_tab_indented_code)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"\tfoo\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_CODE_BLOCK_ENTER));
+	const struct recorded_event *e = find_event(&ctx, MD4S_CODE_TEXT, 0);
+	ASSERT_TRUE(e != NULL);
+	ASSERT_EQUAL_STRING("foo", e->text);
+	md4s_destroy(p);
+}
+
+/* 2 spaces + tab = 4 effective = indented code */
+TEST(md4s_tab_2spaces_tab)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"  \tfoo\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_CODE_BLOCK_ENTER));
+	md4s_destroy(p);
+}
+
+/* 3 spaces + tab = 4 effective = indented code */
+TEST(md4s_tab_3spaces_tab)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"   \tfoo\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_CODE_BLOCK_ENTER));
+	md4s_destroy(p);
+}
+
+/* 1 space + tab = 4 effective = indented code */
+TEST(md4s_tab_1space_tab)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		" \tfoo\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_CODE_BLOCK_ENTER));
+	md4s_destroy(p);
+}
+
+/* Tab before list marker (4+ indent = indented code, not list) */
+TEST(md4s_tab_before_list_marker)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"\t- foo\n");
+	/* Tab = 4 spaces, then '- foo'. The 4-space indent
+	 * means this is indented code, not a list item. */
+	ASSERT_TRUE(has_event(&ctx, MD4S_CODE_BLOCK_ENTER));
+	ASSERT_TRUE(!has_event(&ctx, MD4S_LIST_ENTER));
+	md4s_destroy(p);
+}
+
+/* ================================================================== */
+/* Paragraph Interruption Rules                                        */
+/* ================================================================== */
+
+/* Ordered list start != 1 cannot interrupt paragraph */
+TEST(md4s_interrupt_olist_nonone)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"para\n2. item\n");
+	/* Should be one paragraph with both lines. */
+	ASSERT_EQUAL_INT(1, count_events(&ctx, MD4S_PARAGRAPH_ENTER));
+	ASSERT_TRUE(!has_event(&ctx, MD4S_LIST_ENTER));
+	md4s_destroy(p);
+}
+
+/* Ordered list start == 1 CAN interrupt paragraph */
+TEST(md4s_interrupt_olist_one_can)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"para\n1. item\n");
+	/* Should have both paragraph and list. */
+	ASSERT_TRUE(has_event(&ctx, MD4S_PARAGRAPH_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_LIST_ENTER));
+	md4s_destroy(p);
+}
+
+/* Ordered list start != 1 at start of doc (no paragraph) is allowed */
+TEST(md4s_interrupt_olist_nonone_no_para)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"\n2. item\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_LIST_ENTER));
+	md4s_destroy(p);
+}
+
+/* Empty unordered list item cannot interrupt paragraph */
+TEST(md4s_interrupt_empty_ulist)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"para\n- \n");
+	/* The "- " has empty content, should not interrupt. */
+	ASSERT_EQUAL_INT(1, count_events(&ctx, MD4S_PARAGRAPH_ENTER));
+	ASSERT_TRUE(!has_event(&ctx, MD4S_LIST_ENTER));
+	md4s_destroy(p);
+}
+
+/* Non-empty unordered list item CAN interrupt paragraph */
+TEST(md4s_interrupt_nonempty_ulist)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"para\n- foo\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_PARAGRAPH_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_LIST_ENTER));
+	md4s_destroy(p);
+}
+
+/* Empty ordered list item cannot interrupt paragraph */
+TEST(md4s_interrupt_empty_olist)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"para\n1. \n");
+	ASSERT_EQUAL_INT(1, count_events(&ctx, MD4S_PARAGRAPH_ENTER));
+	ASSERT_TRUE(!has_event(&ctx, MD4S_LIST_ENTER));
+	md4s_destroy(p);
+}
+
+/* HTML block type 7 cannot interrupt paragraph */
+TEST(md4s_interrupt_html_type7)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"para\n<custom>\n\n");
+	/* <custom> is type 7; should be part of paragraph. */
+	ASSERT_TRUE(has_event(&ctx, MD4S_PARAGRAPH_ENTER));
+	ASSERT_TRUE(!has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	md4s_destroy(p);
+}
+
+/* HTML block type 6 (div) CAN interrupt paragraph */
+TEST(md4s_interrupt_html_type6_can)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"para\n<div>\n\n");
+	/* <div> is type 6; CAN interrupt. */
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	md4s_destroy(p);
+}
+
+/* HTML comment (type 2) CAN interrupt paragraph */
+TEST(md4s_interrupt_html_type2_can)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize(&ctx,
+		"para\n<!-- comment -->\n");
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	md4s_destroy(p);
+}
+
+/* ================================================================== */
+/* Configuration Flags API                                             */
+/* ================================================================== */
+
+/* create_ex with default flags behaves like create */
+TEST(md4s_flags_default)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize_ex(&ctx,
+		"~~str~~\n", MD4S_FLAG_DEFAULT);
+	ASSERT_TRUE(has_event(&ctx, MD4S_STRIKETHROUGH_ENTER));
+	md4s_destroy(p);
+}
+
+/* Strikethrough disabled with no flags */
+TEST(md4s_flags_no_strikethrough)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize_ex(&ctx,
+		"~~str~~\n", MD4S_FLAG_TABLES);
+	/* No strikethrough flag → literal text. */
+	ASSERT_TRUE(!has_event(&ctx, MD4S_STRIKETHROUGH_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_TEXT));
+	md4s_destroy(p);
+}
+
+/* Tables disabled */
+TEST(md4s_flags_no_tables)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize_ex(&ctx,
+		"| a | b |\n|---|---|\n| 1 | 2 |\n",
+		MD4S_FLAG_STRIKETHROUGH);
+	/* No tables flag → paragraph with pipe text. */
+	ASSERT_TRUE(!has_event(&ctx, MD4S_TABLE_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_PARAGRAPH_ENTER));
+	md4s_destroy(p);
+}
+
+/* Tables enabled */
+TEST(md4s_flags_tables_enabled)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize_ex(&ctx,
+		"| a | b |\n|---|---|\n| 1 | 2 |\n",
+		MD4S_FLAG_DEFAULT);
+	ASSERT_TRUE(has_event(&ctx, MD4S_TABLE_ENTER));
+	md4s_destroy(p);
+}
+
+/* Task lists disabled */
+TEST(md4s_flags_no_tasklists)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize_ex(&ctx,
+		"- [x] task\n", MD4S_FLAG_TABLES);
+	/* No TASKLISTS flag → list item with literal [x] text. */
+	ASSERT_TRUE(has_event(&ctx, MD4S_LIST_ITEM_ENTER));
+	const struct recorded_event *e = find_event(&ctx,
+		MD4S_LIST_ITEM_ENTER, 0);
+	ASSERT_TRUE(e != NULL);
+	ASSERT_TRUE(!e->is_task);
+	md4s_destroy(p);
+}
+
+/* Task lists enabled */
+TEST(md4s_flags_tasklists_enabled)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize_ex(&ctx,
+		"- [x] task\n", MD4S_FLAG_DEFAULT);
+	const struct recorded_event *e = find_event(&ctx,
+		MD4S_LIST_ITEM_ENTER, 0);
+	ASSERT_TRUE(e != NULL);
+	ASSERT_TRUE(e->is_task);
+	ASSERT_TRUE(e->task_checked);
+	md4s_destroy(p);
+}
+
+/* NOHTMLBLOCKS flag */
+TEST(md4s_flags_nohtmlblocks)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize_ex(&ctx,
+		"<div>\nfoo\n</div>\n",
+		MD4S_FLAG_DEFAULT | MD4S_FLAG_NOHTMLBLOCKS);
+	/* HTML blocks disabled → paragraph. */
+	ASSERT_TRUE(!has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_PARAGRAPH_ENTER));
+	md4s_destroy(p);
+}
+
+/* NOHTMLBLOCKS off → normal HTML block */
+TEST(md4s_flags_htmlblocks_default)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize_ex(&ctx,
+		"<div>\nfoo\n\n",
+		MD4S_FLAG_DEFAULT);
+	ASSERT_TRUE(has_event(&ctx, MD4S_HTML_BLOCK_ENTER));
+	md4s_destroy(p);
+}
+
+/* NOHTMLSPANS flag */
+TEST(md4s_flags_nohtmlspans)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize_ex(&ctx,
+		"<a href=\"#\">link</a>\n",
+		MD4S_FLAG_DEFAULT | MD4S_FLAG_NOHTMLSPANS);
+	/* Inline HTML disabled → literal text. */
+	ASSERT_TRUE(!has_event(&ctx, MD4S_HTML_INLINE));
+	ASSERT_TRUE(has_event(&ctx, MD4S_TEXT));
+	md4s_destroy(p);
+}
+
+/* NOINDENTEDCODE flag */
+TEST(md4s_flags_noindentedcode)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize_ex(&ctx,
+		"    code\n",
+		MD4S_FLAG_DEFAULT | MD4S_FLAG_NOINDENTEDCODE);
+	/* Indented code disabled → paragraph. */
+	ASSERT_TRUE(!has_event(&ctx, MD4S_CODE_BLOCK_ENTER));
+	ASSERT_TRUE(has_event(&ctx, MD4S_PARAGRAPH_ENTER));
+	md4s_destroy(p);
+}
+
+/* Indented code enabled by default */
+TEST(md4s_flags_indentedcode_default)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize_ex(&ctx,
+		"    code\n",
+		MD4S_FLAG_DEFAULT);
+	ASSERT_TRUE(has_event(&ctx, MD4S_CODE_BLOCK_ENTER));
+	md4s_destroy(p);
+}
+
+/* Zero flags: all extensions off */
+TEST(md4s_flags_zero_all_off)
+{
+	struct recorder_ctx ctx = {0};
+	struct md4s_parser *p = feed_and_finalize_ex(&ctx,
+		"~~str~~\n", 0);
+	ASSERT_TRUE(!has_event(&ctx, MD4S_STRIKETHROUGH_ENTER));
+	md4s_destroy(p);
+}
