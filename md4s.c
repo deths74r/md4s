@@ -249,39 +249,29 @@ static bool is_thematic_break(const char *s, size_t len)
 }
 
 /*
- * Unicode-aware word boundary check for emphasis flanking.
- * Classifies the codepoint at the given position.
- * Returns true if the position is at a boundary (start/end of text,
- * whitespace, or punctuation/symbol).
+ * Three-level character classification for CommonMark flanking.
+ * Returns 0 = whitespace/boundary, 1 = punctuation, 2 = other.
  *
- * When look_before is true, examines the codepoint ending at pos.
+ * When before is true, examines the codepoint ending at pos.
  * When false, examines the codepoint starting at pos.
  */
-static bool is_word_boundary(const char *text, size_t len, size_t pos,
-			     bool look_before)
+static int char_class(const char *text, size_t len, size_t pos, bool before)
 {
-	if (look_before && pos == 0)
-		return true;
-	if (!look_before && pos >= len)
-		return true;
+	if (before && pos == 0) return 0;
+	if (!before && pos >= len) return 0;
 
 	uint32_t cp;
-	if (look_before) {
+	if (before) {
 		size_t prev = utf8_prev(text, len, pos);
 		utf8_decode(text + prev, pos - prev, &cp);
 	} else {
 		utf8_decode(text + pos, len - pos, &cp);
 	}
 
-	if (cp == 0)
-		return true;
-	/* Note: ZWSP (U+200B) is intentionally "other", not whitespace.
-	 * See CommonMark spec and gstr spec 11 Change 10. */
-	if (gstr_is_whitespace_cp(cp))
-		return true;
-	if (gstr_is_unicode_punctuation(cp))
-		return true;
-	return false;
+	if (cp == 0) return 0;
+	if (gstr_is_whitespace_cp(cp)) return 0;
+	if (gstr_is_unicode_punctuation(cp)) return 1;
+	return 2;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1001,88 +991,6 @@ static size_t find_backtick_close(const char *text, size_t len,
 	return len;
 }
 
-/*
- * Find matching double delimiter (** or ~~ or __) starting from pos.
- * Respects nesting by skipping backtick code spans.
- */
-static size_t find_double_close(const char *text, size_t len,
-				size_t pos, char ch)
-{
-	while (pos + 1 < len) {
-		if (text[pos] == '\\' && pos + 1 < len) {
-			pos += 2;
-			continue;
-		}
-		if (text[pos] == '`') {
-			/* Skip code span. */
-			int ticks = 0;
-			size_t start = pos;
-			while (pos < len && text[pos] == '`') {
-				ticks++;
-				pos++;
-			}
-			size_t close = find_backtick_close(
-				text, len, pos, ticks);
-			if (close < len)
-				pos = close + (size_t)ticks;
-			else
-				pos = start + 1;
-			continue;
-		}
-		if (text[pos] == ch && text[pos + 1] == ch)
-			return pos;
-		pos++;
-	}
-	return len;
-}
-
-/*
- * Find matching single delimiter (* or _) starting from pos.
- * For underscore, requires word boundary at the close.
- */
-static size_t find_single_close(const char *text, size_t len,
-				size_t pos, char ch)
-{
-	while (pos < len) {
-		if (text[pos] == '\\' && pos + 1 < len) {
-			pos += 2;
-			continue;
-		}
-		if (text[pos] == '`') {
-			int ticks = 0;
-			size_t start = pos;
-			while (pos < len && text[pos] == '`') {
-				ticks++;
-				pos++;
-			}
-			size_t close = find_backtick_close(
-				text, len, pos, ticks);
-			if (close < len)
-				pos = close + (size_t)ticks;
-			else
-				pos = start + 1;
-			continue;
-		}
-		if (text[pos] == ch) {
-			/* Don't match double delimiter as single. */
-			if (pos + 1 < len && text[pos + 1] == ch) {
-				pos += 2;
-				continue;
-			}
-			/* Underscore: require word boundary after. */
-			if (ch == '_') {
-				if (!is_word_boundary(text, len,
-						     pos + 1, false)) {
-					pos++;
-					continue;
-				}
-			}
-			return pos;
-		}
-		pos++;
-	}
-	return len;
-}
 
 /*
  * Recursively parse and emit inline spans for a text region.
@@ -1093,50 +1001,278 @@ static void parse_inline(struct md4s_parser *p, const char *text,
 	parse_inline_depth(p, text, length, 0);
 }
 
+/* ------------------------------------------------------------------ */
+/* Delimiter stack data structures                                     */
+/* ------------------------------------------------------------------ */
+
+#define MARK_OPENER   0x01
+#define MARK_CLOSER   0x02
+#define MARK_RESOLVED 0x04
+#define MARK_BOTH     (MARK_OPENER | MARK_CLOSER)
+
+struct md4s_mark {
+	size_t pos;       /* Byte offset in text where this run starts. */
+	size_t len;       /* Current (remaining) run length.            */
+	size_t orig_len;  /* Original run length before splitting.      */
+	char ch;          /* Delimiter character: '*', '_', or '~'.     */
+	uint8_t flags;    /* MARK_OPENER | MARK_CLOSER | MARK_RESOLVED. */
+	uint8_t mod3;     /* orig_len % 3, cached for rule-of-three.   */
+};
+
+struct md4s_emph_match {
+	size_t open_pos;  /* Position of opening delimiter (inner edge). */
+	size_t close_pos; /* Position of closing delimiter.              */
+	uint8_t len;      /* 1 = italic, 2 = bold/strike.               */
+	char ch;          /* '*', '_', or '~'.                           */
+};
+
+/* Segment types for eager constructs recorded during collection. */
+enum seg_type {
+	SEG_ESCAPE,       /* Backslash escape: emit text[pos+1] as TEXT. */
+	SEG_ENTITY,       /* Entity reference: emit as ENTITY.           */
+	SEG_CODE_SPAN,    /* Code span: emit ENTER/TEXT/LEAVE.           */
+	SEG_HTML_INLINE,  /* Inline HTML: emit as HTML_INLINE.           */
+	SEG_AUTOLINK,     /* Autolink: emit LINK_ENTER/TEXT/LINK_LEAVE.  */
+	SEG_LINK,         /* Link [text](url): recursive text parsing.   */
+	SEG_IMAGE,        /* Image ![alt](url): recursive text parsing.  */
+};
+
+struct seg_entry {
+	enum seg_type type;
+	size_t start;     /* Byte offset of segment start in text.       */
+	size_t end;       /* Byte offset past segment end.               */
+	/* For code spans: content start/len (after space stripping). */
+	size_t cs_start;
+	size_t cs_len;
+	/* For links/images: URL and title pointers + bracket text range. */
+	const char *url;
+	size_t url_len;
+	const char *title;
+	size_t title_len;
+	size_t link_text_start;
+	size_t link_text_len;
+};
+
+/* Event types for the sorted emission list. */
+struct pos_event {
+	size_t pos;
+	uint8_t skip;           /* Bytes to skip (delimiter length).    */
+	enum md4s_event event;
+	int order;              /* 0=LEAVE (first), 1=ENTER (second).   */
+};
+
+#define MARK_INITIAL_CAP  64
+#define MARK_MAX_CAP      512
+#define MATCH_INITIAL_CAP 64
+#define MATCH_MAX_CAP     256
+#define SEG_INITIAL_CAP   64
+#define SEG_MAX_CAP       512
+#define OPENER_BOTTOM_COUNT 13
+
+static int opener_bottom_idx(char ch, uint8_t flags, uint8_t mod3)
+{
+	if (ch == '~') return 12;
+	int ch_idx = (ch == '*') ? 0 : 1;
+	int both = (flags & MARK_BOTH) == MARK_BOTH ? 1 : 0;
+	return ch_idx * 6 + both * 3 + mod3;
+}
+
+static int pos_event_cmp(const void *a, const void *b)
+{
+	const struct pos_event *ea = (const struct pos_event *)a;
+	const struct pos_event *eb = (const struct pos_event *)b;
+	if (ea->pos != eb->pos)
+		return (ea->pos < eb->pos) ? -1 : 1;
+	if (ea->order != eb->order)
+		return ea->order - eb->order;
+	/* For same pos+order: LEAVEs (order=0) sort by skip ASC,
+	 * ENTERs (order=1) sort by skip DESC. */
+	if (ea->order == 0)
+		return (int)ea->skip - (int)eb->skip;
+	return (int)eb->skip - (int)ea->skip;
+}
+
+/*
+ * process_emphasis: resolve delimiter marks into emphasis matches.
+ * Implements the CommonMark algorithm with rule-of-three and
+ * opener-bottom tracking.
+ */
+static int process_emphasis(struct md4s_mark *marks, int mark_count,
+			    struct md4s_emph_match *matches, int match_cap)
+{
+	int match_count = 0;
+	int opener_bottom[OPENER_BOTTOM_COUNT];
+	for (int i = 0; i < OPENER_BOTTOM_COUNT; i++)
+		opener_bottom[i] = -1;
+
+	for (int ci = 0; ci < mark_count; ci++) {
+		struct md4s_mark *closer = &marks[ci];
+		if (!(closer->flags & MARK_CLOSER))
+			continue;
+		if (closer->flags & MARK_RESOLVED)
+			continue;
+		if (closer->len == 0)
+			continue;
+
+		int bottom_idx = opener_bottom_idx(closer->ch,
+			closer->flags, closer->mod3);
+		int bottom = opener_bottom[bottom_idx];
+
+		bool found = false;
+		for (int oi = ci - 1; oi > bottom; oi--) {
+			struct md4s_mark *opener = &marks[oi];
+			if (opener->ch != closer->ch)
+				continue;
+			if (!(opener->flags & MARK_OPENER))
+				continue;
+			if (opener->flags & MARK_RESOLVED)
+				continue;
+			if (opener->len == 0)
+				continue;
+
+			/* Rule of three. */
+			if (closer->ch != '~') {
+				if (((opener->flags & MARK_BOTH) == MARK_BOTH ||
+				     (closer->flags & MARK_BOTH) == MARK_BOTH)) {
+					if ((opener->orig_len + closer->orig_len) % 3 == 0 &&
+					    opener->orig_len % 3 != 0 &&
+					    closer->orig_len % 3 != 0)
+						continue;
+				}
+			}
+
+			/* Match found. Compute use_len. */
+			size_t use_len;
+			if (closer->ch == '~')
+				use_len = 2;
+			else
+				use_len = (opener->len >= 2 &&
+					   closer->len >= 2) ? 2 : 1;
+
+			if (match_count < match_cap) {
+				/* Opener gives rightmost chars. */
+				size_t open_pos = opener->pos +
+					opener->len - use_len;
+				/* Closer gives leftmost chars. */
+				size_t close_pos = closer->pos;
+
+				matches[match_count].open_pos = open_pos;
+				matches[match_count].close_pos = close_pos;
+				matches[match_count].len = (uint8_t)use_len;
+				matches[match_count].ch = closer->ch;
+				match_count++;
+			}
+
+			opener->len -= use_len;
+			closer->pos += use_len;
+			closer->len -= use_len;
+
+			if (opener->len == 0)
+				opener->flags |= MARK_RESOLVED;
+
+			/* Deactivate marks between opener and closer. */
+			for (int k = oi + 1; k < ci; k++) {
+				if (!(marks[k].flags & MARK_RESOLVED))
+					marks[k].flags |= MARK_RESOLVED;
+			}
+
+			found = true;
+
+			/* If closer still has length, re-process it. */
+			if (closer->len > 0)
+				ci--;
+			else
+				closer->flags |= MARK_RESOLVED;
+			break;
+		}
+
+		if (!found) {
+			/* Update opener bottom. */
+			opener_bottom[bottom_idx] = ci - 1;
+			/* If closer-only, remove opener flag. */
+			if ((closer->flags & MARK_BOTH) != MARK_BOTH)
+				closer->flags &= ~MARK_OPENER;
+		}
+	}
+
+	return match_count;
+}
+
 static void parse_inline_depth(struct md4s_parser *p, const char *text,
 			       size_t length, int depth)
 {
 	if (depth >= MAX_INLINE_DEPTH) {
-		/* Too deep — emit remaining text as literal. */
 		if (length > 0)
 			emit_text(p, MD4S_TEXT, text, length);
 		return;
 	}
 
-	size_t pos = 0;
-	size_t plain_start = 0;
+	/* ---- Allocate arrays ---- */
+	struct md4s_mark mark_stack[MARK_INITIAL_CAP];
+	struct md4s_mark *marks = mark_stack;
+	int mark_count = 0;
+	int mark_cap = MARK_INITIAL_CAP;
+	bool marks_heap = false;
 
+	struct seg_entry seg_stack[SEG_INITIAL_CAP];
+	struct seg_entry *segs = seg_stack;
+	int seg_count = 0;
+	int seg_cap = SEG_INITIAL_CAP;
+	bool segs_heap = false;
+
+	/* ============================================================ */
+	/* Phase 1: Collection                                          */
+	/* ============================================================ */
+
+	size_t pos = 0;
 	while (pos < length) {
-		/* Escaped character. */
+		/* Backslash escape. */
 		if (text[pos] == '\\' && pos + 1 < length) {
 			char next = text[pos + 1];
-			/* CommonMark 2.4: only ASCII punctuation can be escaped. */
 			if ((next >= 0x21 && next <= 0x2F) ||
 			    (next >= 0x3A && next <= 0x40) ||
 			    (next >= 0x5B && next <= 0x60) ||
 			    (next >= 0x7B && next <= 0x7E)) {
-				if (pos > plain_start)
-					emit_text(p, MD4S_TEXT,
-						  text + plain_start,
-						  pos - plain_start);
-				emit_text(p, MD4S_TEXT, &text[pos + 1], 1);
+				if (seg_count < seg_cap) {
+					segs[seg_count].type = SEG_ESCAPE;
+					segs[seg_count].start = pos;
+					segs[seg_count].end = pos + 2;
+					seg_count++;
+				} else if (seg_cap < SEG_MAX_CAP) {
+					int new_cap = seg_cap * 2;
+					if (new_cap > SEG_MAX_CAP)
+						new_cap = SEG_MAX_CAP;
+					struct seg_entry *ns;
+					if (segs_heap)
+						ns = realloc(segs, (size_t)new_cap * sizeof(*segs));
+					else {
+						ns = malloc((size_t)new_cap * sizeof(*segs));
+						if (ns) memcpy(ns, segs, (size_t)seg_count * sizeof(*segs));
+					}
+					if (ns) {
+						segs = ns;
+						seg_cap = new_cap;
+						segs_heap = true;
+						segs[seg_count].type = SEG_ESCAPE;
+						segs[seg_count].start = pos;
+						segs[seg_count].end = pos + 2;
+						seg_count++;
+					}
+				}
 				pos += 2;
-				plain_start = pos;
 				continue;
 			}
 		}
 
-		/* Entity/character reference: &name; &#digits; &#xhex; */
+		/* Entity/character reference. */
 		if (text[pos] == '&' && pos + 2 < length) {
 			size_t estart = pos + 1;
 			bool valid = false;
 			if (text[estart] == '#') {
-				/* Numeric: &#digits; or &#xhex; */
 				size_t nstart = estart + 1;
 				if (nstart < length &&
 				    (text[nstart] == 'x' ||
 				     text[nstart] == 'X')) {
-					/* Hex: &#x[0-9a-fA-F]{1,6}; */
 					size_t d = nstart + 1;
 					while (d < length && d < nstart + 7 &&
 					       ((text[d] >= '0' && text[d] <= '9') ||
@@ -1147,7 +1283,6 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 					    text[d] == ';')
 						valid = true;
 				} else {
-					/* Decimal: &#[0-9]{1,7}; */
 					size_t d = nstart;
 					while (d < length && d < nstart + 7 &&
 					       text[d] >= '0' && text[d] <= '9')
@@ -1160,7 +1295,6 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 				    text[estart] <= 'Z') ||
 				   (text[estart] >= 'a' &&
 				    text[estart] <= 'z')) {
-				/* Named: &[A-Za-z][A-Za-z0-9]{0,47}; */
 				size_t d = estart + 1;
 				while (d < length && d < estart + 48 &&
 				       ((text[d] >= 'A' && text[d] <= 'Z') ||
@@ -1172,18 +1306,16 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 					valid = true;
 			}
 			if (valid) {
-				/* Find the semicolon position. */
 				size_t semi = estart;
 				while (semi < length && text[semi] != ';')
 					semi++;
-				if (pos > plain_start)
-					emit_text(p, MD4S_TEXT,
-						  text + plain_start,
-						  pos - plain_start);
-				emit_text(p, MD4S_ENTITY,
-					  text + pos, semi - pos + 1);
+				if (seg_count < seg_cap) {
+					segs[seg_count].type = SEG_ENTITY;
+					segs[seg_count].start = pos;
+					segs[seg_count].end = semi + 1;
+					seg_count++;
+				}
 				pos = semi + 1;
-				plain_start = pos;
 				continue;
 			}
 		}
@@ -1199,14 +1331,6 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 			size_t close = find_backtick_close(
 				text, length, pos, ticks);
 			if (close < length) {
-				if (start > plain_start)
-					emit_text(p, MD4S_TEXT,
-						  text + plain_start,
-						  start - plain_start);
-				emit_simple(p, MD4S_CODE_SPAN_ENTER);
-				/* CommonMark: strip one leading + trailing
-				 * space if both present AND content is not
-				 * entirely spaces. */
 				const char *cs = text + pos;
 				size_t cs_len = close - pos;
 				if (cs_len >= 2 && cs[0] == ' ' &&
@@ -1223,157 +1347,27 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 						cs_len -= 2;
 					}
 				}
-				emit_text(p, MD4S_TEXT, cs, cs_len);
-				emit_simple(p, MD4S_CODE_SPAN_LEAVE);
+				if (seg_count < seg_cap) {
+					segs[seg_count].type = SEG_CODE_SPAN;
+					segs[seg_count].start = start;
+					segs[seg_count].end = close + (size_t)ticks;
+					segs[seg_count].cs_start = (size_t)(cs - text);
+					segs[seg_count].cs_len = cs_len;
+					seg_count++;
+				}
 				pos = close + (size_t)ticks;
-				plain_start = pos;
 				continue;
 			}
-			/* No close — emit backticks as literal. */
+			/* No close — literal backtick, advance one. */
 			pos = start + 1;
 			continue;
 		}
 
-		/* Triple delimiter: ***bold italic*** or ___. */
-		if (pos + 2 < length &&
-		    ((text[pos] == '*' && text[pos + 1] == '*' &&
-		      text[pos + 2] == '*') ||
-		     (text[pos] == '_' && text[pos + 1] == '_' &&
-		      text[pos + 2] == '_'))) {
-			char ch = text[pos];
-			/* Underscore: check word boundary before opener. */
-			if (ch == '_') {
-				if (!is_word_boundary(text, length,
-						     pos, true)) {
-					pos++;
-					continue;
-				}
-			}
-			/* Find closing ***. */
-			size_t inner_start = pos + 3;
-			/* Search for *** close. */
-			size_t close = inner_start;
-			while (close + 2 < length) {
-				if (text[close] == ch &&
-				    text[close + 1] == ch &&
-				    text[close + 2] == ch) {
-					break;
-				}
-				if (text[close] == '\\' &&
-				    close + 1 < length) {
-					close += 2;
-					continue;
-				}
-				close++;
-			}
-			if (close + 2 < length) {
-				if (pos > plain_start)
-					emit_text(p, MD4S_TEXT,
-						  text + plain_start,
-						  pos - plain_start);
-				emit_simple(p, MD4S_BOLD_ENTER);
-				emit_simple(p, MD4S_ITALIC_ENTER);
-				parse_inline_depth(p, text + inner_start,
-					     close - inner_start,
-					     depth + 1);
-				emit_simple(p, MD4S_ITALIC_LEAVE);
-				emit_simple(p, MD4S_BOLD_LEAVE);
-				pos = close + 3;
-				plain_start = pos;
-				continue;
-			}
-		}
-
-		/* Double delimiter: **bold** or __bold__. */
-		if (pos + 1 < length &&
-		    ((text[pos] == '*' && text[pos + 1] == '*') ||
-		     (text[pos] == '_' && text[pos + 1] == '_'))) {
-			char ch = text[pos];
-			if (ch == '_') {
-				if (!is_word_boundary(text, length,
-						     pos, true)) {
-					pos++;
-					continue;
-				}
-			}
-			size_t close = find_double_close(
-				text, length, pos + 2, ch);
-			if (close < length) {
-				if (pos > plain_start)
-					emit_text(p, MD4S_TEXT,
-						  text + plain_start,
-						  pos - plain_start);
-				emit_simple(p, MD4S_BOLD_ENTER);
-				parse_inline_depth(p, text + pos + 2,
-					     close - pos - 2,
-					     depth + 1);
-				emit_simple(p, MD4S_BOLD_LEAVE);
-				pos = close + 2;
-				plain_start = pos;
-				continue;
-			}
-		}
-
-		/* Double tilde: ~~strikethrough~~. */
-		if (pos + 1 < length && text[pos] == '~' &&
-		    text[pos + 1] == '~') {
-			size_t close = find_double_close(
-				text, length, pos + 2, '~');
-			if (close < length) {
-				if (pos > plain_start)
-					emit_text(p, MD4S_TEXT,
-						  text + plain_start,
-						  pos - plain_start);
-				emit_simple(p, MD4S_STRIKETHROUGH_ENTER);
-				parse_inline_depth(p, text + pos + 2,
-					     close - pos - 2,
-					     depth + 1);
-				emit_simple(p, MD4S_STRIKETHROUGH_LEAVE);
-				pos = close + 2;
-				plain_start = pos;
-				continue;
-			}
-		}
-
-		/* Single delimiter: *italic* or _italic_. */
-		if (text[pos] == '*' || text[pos] == '_') {
-			char ch = text[pos];
-			/* Skip if this is a double (handled above). */
-			if (pos + 1 < length && text[pos + 1] == ch) {
-				pos++;
-				continue;
-			}
-			if (ch == '_') {
-				if (!is_word_boundary(text, length,
-						     pos, true)) {
-					pos++;
-					continue;
-				}
-			}
-			size_t close = find_single_close(
-				text, length, pos + 1, ch);
-			if (close < length) {
-				if (pos > plain_start)
-					emit_text(p, MD4S_TEXT,
-						  text + plain_start,
-						  pos - plain_start);
-				emit_simple(p, MD4S_ITALIC_ENTER);
-				parse_inline_depth(p, text + pos + 1,
-					     close - pos - 1,
-					     depth + 1);
-				emit_simple(p, MD4S_ITALIC_LEAVE);
-				pos = close + 1;
-				plain_start = pos;
-				continue;
-			}
-		}
-
-		/* Inline HTML: <tag>, </tag>, <!-- -->, <? ?>, etc. */
+		/* Inline HTML. */
 		if (text[pos] == '<' && pos + 1 < length) {
 			size_t hstart = pos + 1;
 			size_t hend = 0;
 			bool is_html = false;
-			/* Comment: <!-- ... --> */
 			if (hstart + 2 < length && text[hstart] == '!' &&
 			    text[hstart + 1] == '-' &&
 			    text[hstart + 2] == '-') {
@@ -1389,7 +1383,6 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 					s++;
 				}
 			}
-			/* Processing instruction: <? ... ?> */
 			else if (text[hstart] == '?') {
 				size_t s = hstart + 1;
 				while (s + 1 < length) {
@@ -1402,7 +1395,6 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 					s++;
 				}
 			}
-			/* Closing tag: </tagname> */
 			else if (text[hstart] == '/' &&
 				 hstart + 1 < length &&
 				 ((text[hstart + 1] >= 'a' &&
@@ -1423,13 +1415,10 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 					is_html = true;
 				}
 			}
-			/* Open tag: <tagname ...> or <tagname/>
-			 * But NOT autolinks — skip if content has :// or @ */
 			else if ((text[hstart] >= 'a' &&
 				  text[hstart] <= 'z') ||
 				 (text[hstart] >= 'A' &&
 				  text[hstart] <= 'Z')) {
-				/* Quick check: scan for :// or @ to skip autolinks */
 				bool looks_like_url = false;
 				for (size_t ck = hstart; ck < length &&
 				     text[ck] != '>'; ck++) {
@@ -1445,47 +1434,44 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 						break;
 					}
 				}
-				if (looks_like_url)
-					goto skip_inline_html;
-				size_t s = hstart + 1;
-				while (s < length &&
-				       ((text[s] >= 'a' && text[s] <= 'z') ||
-					(text[s] >= 'A' && text[s] <= 'Z') ||
-					(text[s] >= '0' && text[s] <= '9') ||
-					text[s] == '-'))
-					s++;
-				/* Skip attributes. */
-				while (s < length && text[s] != '>') {
-					if (text[s] == '\'' || text[s] == '"') {
-						char q = text[s++];
-						while (s < length &&
-						       text[s] != q)
-							s++;
-						if (s < length)
-							s++;
-					} else {
+				if (!looks_like_url) {
+					size_t s = hstart + 1;
+					while (s < length &&
+					       ((text[s] >= 'a' && text[s] <= 'z') ||
+						(text[s] >= 'A' && text[s] <= 'Z') ||
+						(text[s] >= '0' && text[s] <= '9') ||
+						text[s] == '-'))
 						s++;
+					while (s < length && text[s] != '>') {
+						if (text[s] == '\'' || text[s] == '"') {
+							char q = text[s++];
+							while (s < length &&
+							       text[s] != q)
+								s++;
+							if (s < length)
+								s++;
+						} else {
+							s++;
+						}
 					}
-				}
-				if (s < length && text[s] == '>') {
-					hend = s + 1;
-					is_html = true;
+					if (s < length && text[s] == '>') {
+						hend = s + 1;
+						is_html = true;
+					}
 				}
 			}
 			if (is_html) {
-				if (pos > plain_start)
-					emit_text(p, MD4S_TEXT,
-						  text + plain_start,
-						  pos - plain_start);
-				emit_text(p, MD4S_HTML_INLINE,
-					  text + pos, hend - pos);
+				if (seg_count < seg_cap) {
+					segs[seg_count].type = SEG_HTML_INLINE;
+					segs[seg_count].start = pos;
+					segs[seg_count].end = hend;
+					seg_count++;
+				}
 				pos = hend;
-				plain_start = pos;
 				continue;
 			}
 		}
 
-		skip_inline_html:
 		/* Autolink: <url> or <email>. */
 		if (text[pos] == '<') {
 			size_t close = pos + 1;
@@ -1496,8 +1482,6 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 			    close > pos + 1) {
 				const char *inner = text + pos + 1;
 				size_t inner_len = close - pos - 1;
-				/* Check for URL scheme (contains "://") or
-				 * email (contains "@" and no spaces). */
 				bool is_url = false;
 				bool has_at = false;
 				for (size_t k = 0; k < inner_len; k++) {
@@ -1510,60 +1494,52 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 						has_at = true;
 				}
 				if (is_url || has_at) {
-					if (pos > plain_start)
-						emit_text(p, MD4S_TEXT,
-							  text + plain_start,
-							  pos - plain_start);
-					struct md4s_detail d = {0};
-					d.url = inner;
-					d.url_length = inner_len;
-					emit(p, MD4S_LINK_ENTER, &d);
-					emit_text(p, MD4S_TEXT,
-						  inner, inner_len);
-					emit_simple(p, MD4S_LINK_LEAVE);
+					if (seg_count < seg_cap) {
+						segs[seg_count].type = SEG_AUTOLINK;
+						segs[seg_count].start = pos;
+						segs[seg_count].end = close + 1;
+						segs[seg_count].url = inner;
+						segs[seg_count].url_len = inner_len;
+						seg_count++;
+					}
 					pos = close + 1;
-					plain_start = pos;
 					continue;
 				}
 			}
 		}
 
-		/* Image: ![alt](url) or Link: [text](url). */
+		/* Image or Link: ![alt](url) or [text](url). */
 		if (text[pos] == '[' ||
 		    (text[pos] == '!' && pos + 1 < length &&
 		     text[pos + 1] == '[')) {
 			bool is_image = (text[pos] == '!');
 			size_t bracket_start = is_image ? pos + 1 : pos;
-			/* Find closing ]. */
 			size_t bracket = bracket_start + 1;
-			int depth = 1;
-			while (bracket < length && depth > 0) {
+			int bdepth = 1;
+			while (bracket < length && bdepth > 0) {
 				if (text[bracket] == '\\' &&
 				    bracket + 1 < length) {
 					bracket += 2;
 					continue;
 				}
 				if (text[bracket] == '[')
-					depth++;
+					bdepth++;
 				else if (text[bracket] == ']')
-					depth--;
-				if (depth > 0)
+					bdepth--;
+				if (bdepth > 0)
 					bracket++;
 			}
 			if (bracket < length && text[bracket] == ']' &&
 			    bracket + 1 < length &&
 			    text[bracket + 1] == '(') {
-				/* Find closing ), handling title. */
 				size_t paren_start = bracket + 2;
 				size_t paren = paren_start;
 				const char *url_start = text + paren_start;
 				size_t url_len = 0;
 				const char *title_start = NULL;
 				size_t title_len = 0;
-				/* Skip leading spaces. */
 				while (paren < length && text[paren] == ' ')
 					paren++;
-				/* Scan URL (stop at space, quote, or close paren). */
 				size_t url_begin = paren;
 				int paren_depth = 0;
 				while (paren < length) {
@@ -1582,7 +1558,6 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 				}
 				url_start = text + url_begin;
 				url_len = paren - url_begin;
-				/* Check for title. */
 				if (paren < length && text[paren] == ' ') {
 					while (paren < length &&
 					       text[paren] == ' ')
@@ -1601,40 +1576,30 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 								text + ts;
 							title_len =
 								paren - ts;
-							paren++; /* skip close quote */
+							paren++;
 						}
-						/* Skip trailing spaces. */
 						while (paren < length &&
 						       text[paren] == ' ')
 							paren++;
 					}
 				}
 				if (paren < length && text[paren] == ')') {
-					if (pos > plain_start)
-						emit_text(p, MD4S_TEXT,
-							  text + plain_start,
-							  pos - plain_start);
-					struct md4s_detail d = {0};
-					d.url = url_start;
-					d.url_length = url_len;
-					d.title = title_start;
-					d.title_length = title_len;
-					enum md4s_event enter =
-						is_image
-						? MD4S_IMAGE_ENTER
-						: MD4S_LINK_ENTER;
-					enum md4s_event leave =
-						is_image
-						? MD4S_IMAGE_LEAVE
-						: MD4S_LINK_LEAVE;
-					emit(p, enter, &d);
-					parse_inline_depth(p,
-						text + bracket_start + 1,
-						bracket - bracket_start - 1,
-						depth + 1);
-					emit_simple(p, leave);
+					if (seg_count < seg_cap) {
+						segs[seg_count].type =
+							is_image ? SEG_IMAGE : SEG_LINK;
+						segs[seg_count].start = pos;
+						segs[seg_count].end = paren + 1;
+						segs[seg_count].url = url_start;
+						segs[seg_count].url_len = url_len;
+						segs[seg_count].title = title_start;
+						segs[seg_count].title_len = title_len;
+						segs[seg_count].link_text_start =
+							bracket_start + 1;
+						segs[seg_count].link_text_len =
+							bracket - bracket_start - 1;
+						seg_count++;
+					}
 					pos = paren + 1;
-					plain_start = pos;
 					continue;
 				}
 			}
@@ -1651,9 +1616,9 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 					const char *label;
 					size_t label_len;
 					if (ref_end == ref_start) {
-						/* [text][] — use text as label */
 						label = text + bracket_start + 1;
-						label_len = bracket - bracket_start - 1;
+						label_len = bracket -
+							bracket_start - 1;
 					} else {
 						label = text + ref_start;
 						label_len = ref_end - ref_start;
@@ -1662,31 +1627,29 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 						find_link_def(p, label,
 							      label_len);
 					if (url != NULL) {
-						if (pos > plain_start)
-							emit_text(p, MD4S_TEXT,
-								  text + plain_start,
-								  pos - plain_start);
-						struct md4s_detail d = {0};
-						d.url = url;
-						d.url_length = strlen(url);
-						emit(p, is_image
-							? MD4S_IMAGE_ENTER
-							: MD4S_LINK_ENTER, &d);
-						parse_inline_depth(p,
-							text + bracket_start + 1,
-							bracket - bracket_start - 1,
-							depth + 1);
-						emit_simple(p, is_image
-							? MD4S_IMAGE_LEAVE
-							: MD4S_LINK_LEAVE);
+						if (seg_count < seg_cap) {
+							segs[seg_count].type =
+								is_image ? SEG_IMAGE : SEG_LINK;
+							segs[seg_count].start = pos;
+							segs[seg_count].end = ref_end + 1;
+							segs[seg_count].url = url;
+							segs[seg_count].url_len =
+								strlen(url);
+							segs[seg_count].title = NULL;
+							segs[seg_count].title_len = 0;
+							segs[seg_count].link_text_start =
+								bracket_start + 1;
+							segs[seg_count].link_text_len =
+								bracket - bracket_start - 1;
+							seg_count++;
+						}
 						pos = ref_end + 1;
-						plain_start = pos;
 						continue;
 					}
 				}
 			}
 
-			/* Shortcut reference: [text] alone, if defined. */
+			/* Shortcut reference: [text] alone. */
 			if (bracket < length && text[bracket] == ']') {
 				const char *label =
 					text + bracket_start + 1;
@@ -1695,42 +1658,296 @@ static void parse_inline_depth(struct md4s_parser *p, const char *text,
 				const char *url = find_link_def(
 					p, label, label_len);
 				if (url != NULL) {
-					if (pos > plain_start)
-						emit_text(p, MD4S_TEXT,
-							  text + plain_start,
-							  pos - plain_start);
-					struct md4s_detail d = {0};
-					d.url = url;
-					d.url_length = strlen(url);
-					emit(p, is_image
-						? MD4S_IMAGE_ENTER
-						: MD4S_LINK_ENTER, &d);
-					parse_inline_depth(p,
-						label, label_len,
-						depth + 1);
-					emit_simple(p, is_image
-						? MD4S_IMAGE_LEAVE
-						: MD4S_LINK_LEAVE);
+					if (seg_count < seg_cap) {
+						segs[seg_count].type =
+							is_image ? SEG_IMAGE : SEG_LINK;
+						segs[seg_count].start = pos;
+						segs[seg_count].end = bracket + 1;
+						segs[seg_count].url = url;
+						segs[seg_count].url_len =
+							strlen(url);
+						segs[seg_count].title = NULL;
+						segs[seg_count].title_len = 0;
+						segs[seg_count].link_text_start =
+							bracket_start + 1;
+						segs[seg_count].link_text_len =
+							label_len;
+						seg_count++;
+					}
 					pos = bracket + 1;
-					plain_start = pos;
 					continue;
 				}
 			}
 
-			/* If image prefix didn't match, skip the '!' */
 			if (is_image) {
 				pos++;
 				continue;
 			}
 		}
 
+		/* Delimiter run: *, _, ~. */
+		if (text[pos] == '*' || text[pos] == '_' ||
+		    text[pos] == '~') {
+			char ch = text[pos];
+			size_t run_start = pos;
+			while (pos < length && text[pos] == ch)
+				pos++;
+			size_t run_len = pos - run_start;
+
+			/* Tilde: only runs of exactly 2 are valid. */
+			if (ch == '~' && run_len != 2) {
+				/* Treat as literal text — no mark. */
+				continue;
+			}
+
+			/* Classify flanking. */
+			int before = char_class(text, length,
+						run_start, true);
+			int after = char_class(text, length, pos, false);
+
+			bool left_flanking = (after != 0) &&
+				(after != 1 || before <= 1);
+			bool right_flanking = (before != 0) &&
+				(before != 1 || after <= 1);
+
+			uint8_t flags = 0;
+			if (ch == '_') {
+				if (left_flanking &&
+				    (!right_flanking || before == 1))
+					flags |= MARK_OPENER;
+				if (right_flanking &&
+				    (!left_flanking || after == 1))
+					flags |= MARK_CLOSER;
+			} else {
+				/* '*' and '~' */
+				if (left_flanking)
+					flags |= MARK_OPENER;
+				if (right_flanking)
+					flags |= MARK_CLOSER;
+			}
+
+			if (flags == 0)
+				continue; /* Literal text. */
+
+			/* Record the mark. */
+			if (mark_count >= mark_cap) {
+				if (mark_cap >= MARK_MAX_CAP)
+					continue;
+				int new_cap = mark_cap * 2;
+				if (new_cap > MARK_MAX_CAP)
+					new_cap = MARK_MAX_CAP;
+				struct md4s_mark *nm;
+				if (marks_heap)
+					nm = realloc(marks,
+						(size_t)new_cap * sizeof(*marks));
+				else {
+					nm = malloc(
+						(size_t)new_cap * sizeof(*marks));
+					if (nm)
+						memcpy(nm, marks,
+						       (size_t)mark_count *
+						       sizeof(*marks));
+				}
+				if (!nm) continue;
+				marks = nm;
+				mark_cap = new_cap;
+				marks_heap = true;
+			}
+			marks[mark_count].pos = run_start;
+			marks[mark_count].len = run_len;
+			marks[mark_count].orig_len = run_len;
+			marks[mark_count].ch = ch;
+			marks[mark_count].flags = flags;
+			marks[mark_count].mod3 = (uint8_t)(run_len % 3);
+			mark_count++;
+			continue;
+		}
+
 		pos++;
 	}
 
-	/* Remaining plain text. */
-	if (pos > plain_start)
-		emit_text(p, MD4S_TEXT, text + plain_start,
-			  pos - plain_start);
+	/* ============================================================ */
+	/* Phase 2: Resolution                                          */
+	/* ============================================================ */
+
+	struct md4s_emph_match match_stack[MATCH_INITIAL_CAP];
+	struct md4s_emph_match *matches = match_stack;
+	int match_cap = MATCH_INITIAL_CAP;
+
+	int match_count = process_emphasis(marks, mark_count,
+					   matches, match_cap);
+
+	/* ============================================================ */
+	/* Phase 3: Emission                                            */
+	/* ============================================================ */
+
+	/* Build sorted event list from matches. */
+	int event_count = match_count * 2;
+	struct pos_event *events = NULL;
+	struct pos_event event_stack[128];
+	bool events_heap = false;
+	if (event_count <= 128) {
+		events = event_stack;
+	} else {
+		events = malloc((size_t)event_count * sizeof(*events));
+		if (!events) {
+			events = event_stack;
+			event_count = 0;
+		} else {
+			events_heap = true;
+		}
+	}
+
+	for (int i = 0; i < match_count; i++) {
+		enum md4s_event enter_ev, leave_ev;
+		if (matches[i].ch == '~') {
+			enter_ev = MD4S_STRIKETHROUGH_ENTER;
+			leave_ev = MD4S_STRIKETHROUGH_LEAVE;
+		} else if (matches[i].len == 2) {
+			enter_ev = MD4S_BOLD_ENTER;
+			leave_ev = MD4S_BOLD_LEAVE;
+		} else {
+			enter_ev = MD4S_ITALIC_ENTER;
+			leave_ev = MD4S_ITALIC_LEAVE;
+		}
+		events[i * 2].pos = matches[i].open_pos;
+		events[i * 2].skip = matches[i].len;
+		events[i * 2].event = enter_ev;
+		events[i * 2].order = 1;
+
+		events[i * 2 + 1].pos = matches[i].close_pos;
+		events[i * 2 + 1].skip = matches[i].len;
+		events[i * 2 + 1].event = leave_ev;
+		events[i * 2 + 1].order = 0;
+	}
+
+	if (event_count > 1)
+		qsort(events, (size_t)event_count, sizeof(*events),
+		      pos_event_cmp);
+
+	/* Build a set of byte ranges consumed by resolved marks so
+	 * that unresolved mark text emits as literal. We need to know
+	 * which mark bytes were consumed vs which should be literal. */
+
+	/* Walk text left-to-right, emitting text, segments, and events. */
+	size_t cursor = 0;
+	int ei = 0; /* event index */
+	int si = 0; /* segment index */
+
+	while (cursor < length) {
+		/* Find the next event or segment. */
+		size_t next_event_pos = (ei < event_count)
+			? events[ei].pos : length;
+		size_t next_seg_pos = (si < seg_count)
+			? segs[si].start : length;
+
+		/* Determine what comes next. */
+		size_t next_pos = length;
+		if (next_event_pos < next_pos)
+			next_pos = next_event_pos;
+		if (next_seg_pos < next_pos)
+			next_pos = next_seg_pos;
+
+		/* Emit plain text up to next_pos. */
+		if (next_pos > cursor) {
+			/* But skip over delimiter mark bytes that are
+			 * part of unresolved marks (emit as literal). */
+			emit_text(p, MD4S_TEXT, text + cursor,
+				  next_pos - cursor);
+			cursor = next_pos;
+		}
+
+		if (cursor >= length)
+			break;
+
+		/* Process all events at this position. */
+		while (ei < event_count && events[ei].pos == cursor) {
+			emit_simple(p, events[ei].event);
+			/* Skip the delimiter bytes for this event.
+			 * But only advance cursor if this is a position
+			 * that we need to skip over (opener=ENTER,
+			 * closer=LEAVE). The cursor tracks consumed text. */
+			if (events[ei].order == 1) {
+				/* ENTER: skip opener bytes. */
+				cursor += events[ei].skip;
+			} else {
+				/* LEAVE: skip closer bytes. */
+				cursor += events[ei].skip;
+			}
+			ei++;
+		}
+
+		/* Process segment at this position. */
+		if (si < seg_count && segs[si].start == cursor) {
+			struct seg_entry *seg = &segs[si];
+			switch (seg->type) {
+			case SEG_ESCAPE:
+				emit_text(p, MD4S_TEXT,
+					  &text[seg->start + 1], 1);
+				break;
+			case SEG_ENTITY:
+				emit_text(p, MD4S_ENTITY,
+					  text + seg->start,
+					  seg->end - seg->start);
+				break;
+			case SEG_CODE_SPAN:
+				emit_simple(p, MD4S_CODE_SPAN_ENTER);
+				emit_text(p, MD4S_TEXT,
+					  text + seg->cs_start,
+					  seg->cs_len);
+				emit_simple(p, MD4S_CODE_SPAN_LEAVE);
+				break;
+			case SEG_HTML_INLINE:
+				emit_text(p, MD4S_HTML_INLINE,
+					  text + seg->start,
+					  seg->end - seg->start);
+				break;
+			case SEG_AUTOLINK: {
+				struct md4s_detail d = {0};
+				d.url = seg->url;
+				d.url_length = seg->url_len;
+				emit(p, MD4S_LINK_ENTER, &d);
+				emit_text(p, MD4S_TEXT,
+					  seg->url, seg->url_len);
+				emit_simple(p, MD4S_LINK_LEAVE);
+				break;
+			}
+			case SEG_LINK:
+			case SEG_IMAGE: {
+				struct md4s_detail d = {0};
+				d.url = seg->url;
+				d.url_length = seg->url_len;
+				d.title = seg->title;
+				d.title_length = seg->title_len;
+				enum md4s_event enter =
+					(seg->type == SEG_IMAGE)
+					? MD4S_IMAGE_ENTER
+					: MD4S_LINK_ENTER;
+				enum md4s_event leave =
+					(seg->type == SEG_IMAGE)
+					? MD4S_IMAGE_LEAVE
+					: MD4S_LINK_LEAVE;
+				emit(p, enter, &d);
+				parse_inline_depth(p,
+					text + seg->link_text_start,
+					seg->link_text_len,
+					depth + 1);
+				emit_simple(p, leave);
+				break;
+			}
+			}
+			cursor = seg->end;
+			si++;
+		}
+	}
+
+	/* Clean up. */
+	if (marks_heap)
+		free(marks);
+	if (segs_heap)
+		free(segs);
+	if (events_heap)
+		free(events);
 }
 
 /* ------------------------------------------------------------------ */

@@ -2124,13 +2124,14 @@ TEST(md4s_seq_list)
 	md4s_destroy(p);
 }
 
-/* Nested inline formatting sequence */
+/* Nested inline formatting sequence.
+ * CommonMark spec: ***both*** = <em><strong>both</strong></em>
+ * Italic is the outermost, bold is innermost. */
 TEST(md4s_seq_bold_italic)
 {
 	struct recorder_ctx ctx = {0};
 	struct md4s_parser *p = feed_and_finalize(&ctx,
 		"***both***\n");
-	/* Inside paragraph: BOLD_ENTER, ITALIC_ENTER, TEXT, ITALIC_LEAVE, BOLD_LEAVE */
 	ASSERT_TRUE(has_event(&ctx, MD4S_BOLD_ENTER));
 	ASSERT_TRUE(has_event(&ctx, MD4S_ITALIC_ENTER));
 	/* Find positions and verify ordering */
@@ -2149,10 +2150,10 @@ TEST(md4s_seq_bold_italic)
 		if (ctx.events[i].event == MD4S_BOLD_LEAVE && bold_leave < 0)
 			bold_leave = i;
 	}
-	ASSERT_TRUE(bold_enter < italic_enter);
-	ASSERT_TRUE(italic_enter < text_pos);
-	ASSERT_TRUE(text_pos < italic_leave);
-	ASSERT_TRUE(italic_leave < bold_leave);
+	ASSERT_TRUE(italic_enter < bold_enter);
+	ASSERT_TRUE(bold_enter < text_pos);
+	ASSERT_TRUE(text_pos < bold_leave);
+	ASSERT_TRUE(bold_leave < italic_leave);
 	md4s_destroy(p);
 }
 
