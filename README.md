@@ -8,11 +8,9 @@ Completed lines are emitted once and never revisited. 94% CommonMark spec compli
 
 ## Why
 
-Every C markdown parser (md4c, cmark, sundown) is a batch parser — it needs the complete document before producing output. This forces terminal applications into a cursor-up-and-clear loop that breaks on line wrapping, scrollback, tmux, and SSH latency.
+Existing C markdown parsers are batch parsers — they need the complete document before they can produce any output. When markdown arrives incrementally (as it does from streaming LLM APIs), applications are forced to re-parse the entire accumulated text on every new token, then re-render the full output. This is wasteful and creates rendering artifacts in terminals.
 
-Claude Code, aider, and mods all have this bug. md4s solves it permanently by never moving the cursor backward.
-
-Designed for AI CLI tools that stream LLM responses, but works anywhere markdown arrives incrementally.
+md4s processes markdown as it arrives. Each completed line is parsed once, emitted as semantic events, and never revisited. Renderers built on md4s can append output incrementally without re-processing anything — they receive exactly the events they need, when they need them.
 
 ## Features
 
